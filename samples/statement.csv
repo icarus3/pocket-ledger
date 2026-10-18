@@ -1,0 +1,7 @@
+Date,Description,Debit,Credit,Category,Subcategory,Account
+01/10/2026,Monthly salary,0,125000,Salary,Monthly pay,Everyday account
+02/10/2026,Apartment rent,28000,0,Home & living,Rent,Everyday account
+03/10/2026,"Groceries, weekly shop",2500,0,Food & groceries,Groceries,Everyday account
+04/10/2026,Internet bill,1200,0,Home & living,Utilities,Everyday account
+05/10/2026,School activities,4500,0,Family & care,Activities,Everyday account
+06/10/2026,Grocery refund,0,250,Food & groceries,Groceries,Everyday account

@@ -1,0 +1,14 @@
+import { build } from 'esbuild';
+import fs from 'node:fs/promises';
+await fs.mkdir('dist/vendor', {recursive:true});
+await build({entryPoints:['src/app.js'],bundle:true,format:'esm',target:'chrome110',outfile:'dist/app.js',minify:true,legalComments:'linked'});
+await fs.copyFile('src/styles.css','dist/styles.css');
+await fs.copyFile('src/index.html','dist/index.html');
+await fs.cp('node_modules/clawpdf/dist','dist/vendor/pdf',{recursive:true});
+await fs.mkdir('dist/licenses',{recursive:true});
+for (const name of ['clawpdf','fflate']) await fs.copyFile(`node_modules/${name}/LICENSE`,`dist/licenses/${name}.txt`);
+await fs.copyFile('node_modules/clawpdf/THIRD_PARTY_NOTICES.md','dist/licenses/pdfium-notices.txt');
+await fs.cp('samples','dist/samples',{recursive:true});
+await fs.mkdir('android/app/src/main/assets/www',{recursive:true});
+await fs.cp('dist','android/app/src/main/assets/www',{recursive:true});
+console.log('Built offline app and Android assets.');

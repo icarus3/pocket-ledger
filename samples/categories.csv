@@ -1,0 +1,8 @@
+Category,Subcategory,Type,Role
+Food & groceries,Groceries,Expense,expense
+Food & groceries,Dining out,Expense,expense
+Travel & holidays,Flights,Expense,expense
+Travel & holidays,Hotels,Expense,expense
+Salary,Monthly pay,Salary,income
+Freelance,Projects,Freelance income,income
+Savings,Own accounts,Transfer,transfer
