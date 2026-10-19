@@ -6,7 +6,7 @@ import {newData,classificationValue,normalizeDate} from '../src/core.js';
 import {createVault,unlock} from '../src/vault.js';
 
 const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'C:/Program Files/Google/Chrome/Application/chrome.exe',headless:true,args:['--no-first-run','--disable-background-networking']});
-const context=await browser.newContext({viewport:{width:1280,height:900},acceptDownloads:true});
+const context=await browser.newContext({viewport:{width:1280,height:900},acceptDownloads:true,hasTouch:true});
 let page=await context.newPage();const errors=[],checks=[];
 const watch=()=>page.on('pageerror',e=>errors.push(e.message));watch();
 const nav=v=>page.locator(`.sidebar [data-view="${v}"]`).click();
@@ -38,6 +38,18 @@ try{
   await nav('transactions');await action('add-transaction');await input('description').fill('Optional classification');await input('debit').fill('12.50');await save();assert.ok(await page.locator('.ledger-table').evaluate(t=>t.scrollWidth<=t.parentElement.clientWidth+1));let row=page.locator('tbody tr').filter({hasText:'Optional classification'});await row.waitFor();
   assert.equal(await row.locator('[data-classification=category]').inputValue(),'');await row.locator('[data-classification=category]').selectOption('home');await row.locator('[data-classification=subcategory]').selectOption(classificationValue('food','Groceries'));await persisted(d=>d.transactions.some(t=>t.description==='Optional classification'&&t.categoryId==='food'));
   assert.equal(await row.locator('[data-classification=category]').inputValue(),'food');await row.locator('[data-classification=subcategory]').selectOption('');await row.locator('[data-classification=category]').selectOption('');check('optional category/subcategory and direct row dropdowns with automatic parent');
+
+  await action('add-transaction');await input('description').fill('Replace amount typing');
+  await input('debit').click();await input('debit').pressSequentially('233');assert.equal(await input('debit').inputValue(),'233');assert.equal(await input('final').inputValue(),'233.00');
+  await input('final').click();assert.equal(await input('final').inputValue(),'233.00');await input('final').pressSequentially('200');assert.equal(await input('final').inputValue(),'200');
+  await input('credit').tap();await input('credit').pressSequentially('3');assert.equal(await input('credit').inputValue(),'3');assert.equal(await input('final').inputValue(),'197.00');
+  await input('account').click();await page.keyboard.press('Tab');await page.keyboard.type('250');assert.equal(await input('debit').inputValue(),'250');assert.equal(await input('final').inputValue(),'214.00');
+  await save();await persisted(d=>d.transactions.some(t=>t.description==='Replace amount typing'&&t.debit===25000&&t.credit===300&&t.adjustment===-3300));
+  await nav('budgets');await action('add-budget');await input('amount').tap();await input('amount').pressSequentially('233');assert.equal(await input('amount').inputValue(),'233');await action('close-modal');
+  await nav('timeline');await action('add-milestone');await input('target').click();await input('target').pressSequentially('233');assert.equal(await input('target').inputValue(),'233');await input('saved').tap();await input('saved').pressSequentially('12.50');assert.equal(await input('saved').inputValue(),'12.50');await action('close-modal');
+  await nav('imports');await page.locator('#statement-file').setInputFiles({name:'replace-amount.csv',mimeType:'text/csv',buffer:Buffer.from('Date,Description,Debit,Credit\n01/10/2026,Replace review amount,0,10')});await page.locator('#map-form [type=submit]').click();await page.locator('.review').waitFor();
+  const reviewDebit=page.locator('[data-review="0"][data-field=debit]');await reviewDebit.tap();await reviewDebit.pressSequentially('233');assert.equal(await reviewDebit.inputValue(),'233');const reviewCredit=page.locator('[data-review="0"][data-field=credit]');await reviewCredit.tap();await reviewCredit.pressSequentially('12');assert.equal(await reviewCredit.inputValue(),'12');await persisted(d=>d.workspace.importReview[0]?.debit===23300&&d.workspace.importReview[0]?.credit===1200);await action('reset-import');await page.locator('#statement-file').waitFor({state:'attached'});await nav('transactions');
+  check('amount typing replaces defaults and existing values with mouse, touch and keyboard across forms and import review');
 
   await action('add-transaction');await input('description').fill('Unsaved edit draft');await input('debit').fill('45.67');await persisted(d=>d.workspace.modal?.values.some(v=>v.name==='description'&&v.value==='Unsaved edit draft'));
   await page.evaluate(()=>window.pocketLedgerBackground());await page.evaluate(()=>window.pocketLedgerResume());assert.equal(await page.locator('#auth-form').count(),0);assert.equal(await input('description').inputValue(),'Unsaved edit draft');await page.evaluate(()=>{const now=Date.now;Date.now=()=>now()+6*60000;window.pocketLedgerResume();Date.now=now;});await page.locator('#auth-form').waitFor();await reopen();assert.equal(await input('description').inputValue(),'Unsaved edit draft');assert.equal(await input('debit').inputValue(),'45.67');await save();await persisted(d=>d.workspace.modal===null&&d.transactions.some(t=>t.description==='Unsaved edit draft'));check('background session and encrypted form draft survive closing and reopening');
