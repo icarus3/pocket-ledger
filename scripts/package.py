@@ -6,7 +6,7 @@ import shutil
 root = Path(__file__).resolve().parent.parent
 destination = root / 'deliverables'
 destination.mkdir(exist_ok=True)
-source_files = ['package.json', 'README.md', 'Build-Android.cmd', 'Prepare-Android-Tools.cmd', '.gitignore']
+source_files = ['package.json', 'README.md', 'AGENTS.md', 'Build-Android.cmd', 'Prepare-Android-Tools.cmd', '.gitignore']
 trees = ['src', 'samples', 'scripts', 'tests', 'android', 'previews']
 excluded = {'.gradle', 'build', 'node_modules', '__pycache__'}
 
@@ -35,6 +35,7 @@ with zipfile.ZipFile(preview, 'w', zipfile.ZIP_DEFLATED, compresslevel=6) as arc
         if file.is_file():
             archive.write(file, file.relative_to(root).as_posix())
     archive.write(root / 'README.md', 'README.md')
+    archive.write(root / 'AGENTS.md', 'AGENTS.md')
 
 artifacts = [source, preview]
 apk = root / 'releases' / 'Pocket-Ledger-release.apk'
