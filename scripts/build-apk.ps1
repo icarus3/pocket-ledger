@@ -49,17 +49,8 @@ if (-not $UseBundledAssets) {
     if ($LASTEXITCODE -ne 0) { throw 'Web application build failed.' }
 } elseif (-not (Test-Path -LiteralPath 'android/app/src/main/assets/www/app.js')) { throw 'Bundled app assets are missing. Run the regular build first.' }
 ('sdk.dir=' + $sdkPath.Replace('\','/')) | Set-Content -LiteralPath android/local.properties -Encoding ascii
-if (-not $DebugBuild -and -not (Test-Path -LiteralPath android/keystore.properties)) {
-    $bytes = New-Object byte[] 32
-    [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-    $signingPassword = [Convert]::ToBase64String($bytes)
-    # Password is supplied via an environment variable, not exposed in process arguments.
-    $env:POCKET_LEDGER_SIGNING_PASSWORD = $signingPassword
-    & (Join-Path $javaBin 'keytool.exe') -genkeypair -keystore android/personal-release.jks -alias pocketledger -keyalg RSA -keysize 3072 -validity 10000 -storepass:env POCKET_LEDGER_SIGNING_PASSWORD -keypass:env POCKET_LEDGER_SIGNING_PASSWORD -dname 'CN=Pocket Ledger Personal, O=Personal, C=IN'
-    if ($LASTEXITCODE -ne 0) { throw 'Signing key creation failed.' }
-    "storeFile=personal-release.jks`nstorePassword=$signingPassword`nkeyAlias=pocketledger`nkeyPassword=$signingPassword" | Set-Content -LiteralPath android/keystore.properties -Encoding ascii
-    Remove-Item Env:POCKET_LEDGER_SIGNING_PASSWORD
-    Write-Host 'Keep android/personal-release.jks and android/keystore.properties private and backed up: future updates need this key.'
+if (-not $DebugBuild -and (-not (Test-Path -LiteralPath android/keystore.properties) -or -not (Test-Path -LiteralPath android/personal-release.jks))) {
+    throw 'Update signing files are missing. Restore the existing private key and keystore.properties; this build will not generate a replacement key.'
 }
 $target = if ($DebugBuild) { 'assembleDebug' } else { 'assembleRelease' }
 $gradleArgs = @('-p', 'android', $target, 'lint', '--no-daemon')

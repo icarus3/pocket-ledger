@@ -17,7 +17,7 @@ def safe_files():
         for file in (root / name).rglob('*'):
             if not file.is_file() or any(part in excluded for part in file.relative_to(root).parts):
                 continue
-            if file.name in {'local.properties', 'keystore.properties'} or file.suffix == '.jks':
+            if file.name in {'local.properties', 'keystore.properties'} or file.suffix.lower() in {'.jks', '.keystore', '.p12', '.pfx'} or file.name == '.env' or file.name.startswith('.env.'):
                 continue
             yield file
 

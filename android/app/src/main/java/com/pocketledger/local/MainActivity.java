@@ -3,6 +3,7 @@ package com.pocketledger.local;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.res.Configuration;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
@@ -99,6 +100,18 @@ public final class MainActivity extends Activity {
     }
 
     private final class FileBridge {
+        @JavascriptInterface public boolean isSystemDark() {
+            return (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        }
+        @JavascriptInterface public void setDarkAppearance(boolean dark) {
+            runOnUiThread(() -> {
+                int color = dark ? Color.rgb(20, 28, 25) : Color.rgb(245, 246, 241);
+                web.setBackgroundColor(color);
+                getWindow().setStatusBarColor(color);
+                getWindow().setNavigationBarColor(color);
+                getWindow().getDecorView().setSystemUiVisibility(dark ? 0 : View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+            });
+        }
         @JavascriptInterface public boolean isFilePickerOpen() { return pickerOpen; }
         @JavascriptInterface public void saveFile(String filename, String mime, String content) {
             if (content == null || content.length() > 60 * 1024 * 1024) return;
@@ -148,10 +161,21 @@ public final class MainActivity extends Activity {
         if (web != null) web.evaluateJavascript("window.pocketLedgerLock && window.pocketLedgerLock()", null);
     }
     @Override protected void onPause() {
-        if (!pickerOpen) lockLedger();
+        if (web != null) web.evaluateJavascript("window.pocketLedgerBackground && window.pocketLedgerBackground()", null);
         super.onPause();
     }
-    @Override public void onBackPressed() { lockLedger(); super.onBackPressed(); }
+    @Override protected void onResume() {
+        super.onResume();
+        if (web != null) web.evaluateJavascript("window.pocketLedgerResume && window.pocketLedgerResume()", null);
+    }
+    @Override public void onConfigurationChanged(Configuration configuration) {
+        super.onConfigurationChanged(configuration);
+        if (web != null) web.evaluateJavascript("window.pocketLedgerResume && window.pocketLedgerResume()", null);
+    }
+    @Override public void onBackPressed() {
+        if (web != null) web.evaluateJavascript("window.pocketLedgerBackground && window.pocketLedgerBackground()", null);
+        moveTaskToBack(true);
+    }
     @Override protected void onDestroy() {
         if (fileCallback != null) fileCallback.onReceiveValue(null);
         pendingExport = null;

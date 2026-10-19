@@ -1,10 +1,11 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import * as C from '../src/core.js';
-import {createVault,unlock,encrypt} from '../src/vault.js';
+import {createVault,createPinVault,changeCredential,unlock,encrypt} from '../src/vault.js';
 import {mapTransactions,autoMap} from '../src/imports.js';
 
 test('money parsing is exact, handles bank notation and rejects ambiguous decimals',()=>{
+  assert.equal(C.moneyInput(0.29),29);assert.ok(Number.isNaN(C.moneyInput(1.234)));assert.ok(Number.isNaN(C.moneyInput(0.004)));
   assert.equal(C.moneyInput('1,23,456.78'),12345678);assert.equal(C.moneyInput('(25.01)'),-2501);assert.equal(C.moneyInput('250.00 DR'),-25000);assert.equal(C.moneyInput('250.00 CR'),25000);assert.equal(C.moneyInput('0.29'),29);assert.equal(C.moneyInput('—'),0);assert.ok(Number.isNaN(C.moneyInput('10.001')));assert.ok(Number.isNaN(C.moneyInput('1e3')));
 });
 test('date normalization validates calendar boundaries and avoids timezone shifts',()=>{
@@ -43,7 +44,7 @@ test('milestone projection handles zero growth, birthdays, inflation and past da
 });
 test('CSV exports date dimensions, currency, three amount columns and neutralizes formulas',()=>{
   const d=C.newData();d.transactions=[{date:'2026-01-02',description:'=HYPERLINK("bad")',categoryId:'food',debit:100,credit:50,adjustment:10,currency:'USD'}];
-  const csv=C.exportTransactions(d);assert.match(csv,/"Month","Year"/);assert.match(csv,/"Currency","Debit"/);assert.match(csv,/"'=/);assert.match(csv,/"0.6"/);
+  const csv=C.exportTransactions(d);assert.match(csv,/"Month","Year"/);assert.match(csv,/"Currency","Review status","Raw values","Debit"/);assert.match(csv,/"'=/);assert.match(csv,/"0.6"/);
   assert.deepEqual(C.parseCSV(csv)[0].slice(-3),['Debit','Final debit','Credit']);
 });
 test('subcategory selection determines its parent and disambiguates repeated names',()=>{
@@ -63,13 +64,13 @@ test('imports infer parents, preserve unknown or ambiguous subcategories for rev
   const mapped=mapTransactions(rows,mapping,{categories:d.categories});
   assert.equal(mapped[0].categoryId,'home');assert.equal(mapped[1].categoryId,'');assert.equal(mapped[2].categoryId,'extra');assert.equal(mapped[2].subcategory,'Groceries');
   assert.equal(mapped[3].subcategory,'Missing sub');assert.equal(mapped[3].categoryId,'');assert.equal(mapped[4].categoryId,'');
-  assert.ok(C.transactionError(mapped[1],d));assert.ok(C.transactionError(mapped[4],d));
+  assert.ok(C.transactionError(mapped[1],d));assert.equal(C.transactionError(mapped[4],d),'');
   const withDefault=mapTransactions(rows,mapping,{categories:d.categories,defaultSubcategory:C.classificationValue('food','Dining out')});
   assert.equal(withDefault[1].categoryId,'');assert.equal(withDefault[3].categoryId,'');assert.equal(withDefault[4].categoryId,'food');assert.equal(withDefault[4].subcategory,'Dining out');
 });
-test('new transactions require a subcategory, legacy backups remain readable and invalid final amounts fail validation',()=>{
+test('categories are optional, legacy backups remain readable and invalid final amounts fail validation',()=>{
   const d=C.newData(),t={id:'t',date:'2026-10-01',description:'Shop',categoryId:'food',subcategory:'Groceries',debit:10000,credit:2000,adjustment:-500,currency:'CHF'};
-  assert.equal(C.transactionError(t,d),'');assert.ok(C.transactionError({...t,subcategory:''},d));assert.ok(C.transactionError({...t,categoryId:'home'},d));
+  assert.equal(C.transactionError(t,d),'');assert.equal(C.transactionError({...t,subcategory:''},d),'');assert.equal(C.transactionError({...t,categoryId:'',subcategory:''},d),'');assert.ok(C.transactionError({...t,categoryId:'home'},d));
   assert.ok(C.transactionError({...t,adjustment:NaN},d));assert.ok(Number.isNaN(C.finalDebit({...t,adjustment:NaN})));
   d.transactions=[{...t,subcategory:''}];assert.equal(C.validateData(d),d);
 });
@@ -89,4 +90,25 @@ test('encrypted vault round trips, randomizes ciphertext, and rejects wrong pass
   await assert.rejects(unlock(vault.envelope,'incorrect password'));
   await assert.rejects(unlock({...vault.envelope,ciphertext:(vault.envelope.ciphertext[0]==='A'?'B':'A')+vault.envelope.ciphertext.slice(1)},'correct horse battery'));
   await assert.rejects(unlock({...vault.envelope,iterations:9e9},'correct horse battery'));
+});
+
+test('unresolved imports preserve raw values through encryption, remain null and are excluded from calculations',async()=>{
+  const data=C.newData(),rows=C.parseCSV('Date,Description,Debit,Credit,Final debit\n01/10/2026,"  Original description  ",1.234,0,???\n02/10/2026,Valid,10,0,10');
+  const tx=mapTransactions(rows.slice(1),autoMap(rows[0]),{categories:data.categories}).map(t=>({...t,currency:'INR',categoryId:'food',needsReview:!!C.transactionError(t,data)}));
+  assert.equal(tx[0].debit,null);assert.equal(tx[0].adjustment,null);assert.equal(tx[0].description,'  Original description  ');assert.equal(tx[0].rawValues.debit,'1.234');assert.ok(Number.isNaN(C.finalDebit(tx[0])));
+  data.transactions=tx;assert.equal(C.actual(data,'food','2026-10'),1000);assert.equal(C.reportRows(data,{currency:'INR'}).length,1);
+  const vault=await createVault(data,'legacy recovery password');const restored=(await unlock(vault.envelope,'legacy recovery password')).data;
+  assert.equal(restored.transactions[0].debit,null);assert.equal(restored.transactions[0].rawValues.final,'???');assert.match(C.exportTransactions(restored),/1.234/);
+});
+test('PIN setup, rotation and recovery preserve legacy data and encrypted drafts',async()=>{
+  const data=C.newData();data.workspace={view:'imports',importReview:[{rawValues:{amount:'unresolved-secret'}}],modal:{kind:'transaction',values:[{name:'description',value:'private draft'}]}};
+  const legacy=await createVault(data,'legacy recovery password'),original=(await unlock(legacy.envelope,'legacy recovery password')).data;
+  const migrated=await createPinVault(original,'0042','legacy recovery password');assert.equal(migrated.envelope.version,2);
+  assert.deepEqual((await unlock(migrated.envelope,'0042')).data,data);assert.deepEqual((await unlock(migrated.envelope,'legacy recovery password','recovery')).data,data);
+  assert.ok(!JSON.stringify(migrated.envelope).includes('private draft'));await assert.rejects(unlock(migrated.envelope,'0043'));
+  const changed=await changeCredential(migrated.envelope,data,'0042','5678');await assert.rejects(unlock(changed.envelope,'0042'));assert.deepEqual((await unlock(changed.envelope,'5678')).data,data);
+  const recovered=await changeCredential(changed.envelope,data,'legacy recovery password','0007','pin',true);assert.deepEqual((await unlock(recovered.envelope,'0007')).data,data);
+  const password=await changeCredential(recovered.envelope,data,'legacy recovery password','new recovery password','recovery');await assert.rejects(unlock(password.envelope,'legacy recovery password','recovery'));assert.deepEqual((await unlock(password.envelope,'0007')).data,data);
+  await assert.rejects(createPinVault(data,'123','safe recovery password'));await assert.rejects(createPinVault(data,'12345','safe recovery password'));
+  await assert.rejects(changeCredential(password.envelope,data,'wrong recovery','1234','pin',true));assert.deepEqual((await unlock(password.envelope,'new recovery password','recovery')).data,data);
 });

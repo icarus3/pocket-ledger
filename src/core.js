@@ -1,9 +1,13 @@
 export const uid = () => crypto.randomUUID();
 export const round = n => Math.round(n + Number.EPSILON);
 export const today = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
-export const finalDebit = t => t.debit - t.credit + (t.adjustment ?? 0);
+export const amountsResolved = t => [t.debit,t.credit,t.adjustment === undefined ? 0 : t.adjustment].every(Number.isSafeInteger);
+export const finalDebit = t => amountsResolved(t) ? t.debit - t.credit + (t.adjustment ?? 0) : NaN;
 export function moneyInput(value) {
-  if (typeof value === 'number') return Number.isFinite(value) ? round(value * 100) : NaN;
+  if (typeof value === 'number') {
+    const cents=value*100,nearest=round(cents);
+    return Number.isFinite(value)&&Number.isSafeInteger(nearest)&&Math.abs(cents-nearest)<1e-6 ? nearest : NaN;
+  }
   let s = String(value ?? '').trim();
   if (!s || s === '-' || s === '—') return 0;
   const negative = /^\(.*\)$/.test(s) || /\bDR$/i.test(s);
@@ -35,12 +39,12 @@ export function parseCSV(text, delimiter) {
   for (let i=0;i<text.length;i++) {
     const c = text[i];
     if (c === '"') { if (quote && text[i+1] === '"') { cell += '"'; i++; } else if (quote || cell === '') quote = !quote; else cell += c; }
-    else if (c === delimiter && !quote) { row.push(cell.trim()); cell = ''; }
-    else if ((c === '\n' || c === '\r') && !quote) { if (c === '\r' && text[i+1] === '\n') i++; row.push(cell.trim()); if(row.some(Boolean)) rows.push(row); row=[]; cell=''; }
+    else if (c === delimiter && !quote) { row.push(cell); cell = ''; }
+    else if ((c === '\n' || c === '\r') && !quote) { if (c === '\r' && text[i+1] === '\n') i++; row.push(cell); if(row.some(Boolean)) rows.push(row); row=[]; cell=''; }
     else cell += c;
   }
   if (quote) throw new Error('An opening quote in this file has no closing quote. Correct the CSV and try again.');
-  row.push(cell.trim()); if(row.some(Boolean)) rows.push(row);
+  row.push(cell); if(row.some(Boolean)) rows.push(row);
   return rows;
 }
 export function toCSV(rows) {
@@ -52,7 +56,7 @@ export function toCSV(rows) {
   }).join(',')).join('\r\n');
 }
 export function newData() {
-  return {version:1, settings:{currency:'INR',dateFormat:'DMY',autoLock:5},
+  return {version:1, settings:{currency:'INR',dateFormat:'DMY',autoLock:5,appearance:'system'},
     types:[{id:'expense',name:'Expense',role:'expense'},{id:'income',name:'Income',role:'income'},{id:'salary',name:'Salary',role:'income'},{id:'transfer',name:'Transfer',role:'transfer'}],
     categories:[{id:'home',name:'Home & living',typeId:'expense',subs:['Rent','Utilities','Maintenance']},{id:'food',name:'Food & groceries',typeId:'expense',subs:['Groceries','Dining out']},{id:'travel',name:'Transport',typeId:'expense',subs:['Fuel','Public transport']},{id:'family',name:'Family & care',typeId:'expense',subs:['Education','Health','Activities']},{id:'life',name:'Lifestyle',typeId:'expense',subs:['Shopping','Subscriptions']},{id:'pay',name:'Salary',typeId:'salary',subs:['Monthly pay','Bonus']},{id:'other',name:'Other income',typeId:'income',subs:['Interest','Refunds']}],
     transactions:[],budgets:[],reports:[],family:[],milestones:[],imports:[]};
@@ -77,17 +81,17 @@ export function matchSubcategory(categories, subcategory, parentName = '') {
   const qualified = matches.filter(m => m.categoryId === parent?.id);
   return qualified.length === 1 ? qualified[0] : null;
 }
-export function transactionError(t, data, {requireSubcategory = true} = {}) {
+export function transactionError(t, data) {
   if(!['INR','CHF','USD'].includes(t.currency || data.settings.currency))return 'Choose INR, CHF or USD.';
   if (!normalizeDate(t.date)) return 'Enter a valid date.';
   if (!String(t.description || '').trim()) return 'Add a description.';
-  if (![t.debit,t.credit,t.adjustment ?? 0].every(n => Number.isSafeInteger(n) && Math.abs(n) < 1e14) || t.debit < 0 || t.credit < 0) return 'Enter valid amounts with up to two decimal places. Debit and credit cannot be negative.';
+  if (!amountsResolved(t) || ![t.debit,t.credit,t.adjustment ?? 0].every(n => Math.abs(n) < 1e14) || t.debit < 0 || t.credit < 0) return 'Amount needs review. Raw values are preserved and this row is excluded from totals.';
   if (t.debit === 0 && t.credit === 0 && !t.adjustment) return 'Add a debit or credit amount.';
   const category = data.categories.find(c => c.id === t.categoryId);
-  if (!category || (requireSubcategory && !t.subcategory) || (t.subcategory && !category.subs.includes(t.subcategory))) return 'Choose a valid subcategory; its main category is assigned automatically.';
+  if ((t.categoryId && !category) || (t.subcategory && !category?.subs.includes(t.subcategory))) return 'Category needs review. Choose a matching subcategory or leave it unassigned.';
   return '';
 }
-export function fingerprint(t) { return [t.date,String(t.description).trim().toLowerCase().replace(/\s+/g,' '),t.debit,t.credit,String(t.account || '').trim().toLowerCase(),t.currency||'INR'].join('|'); }
+export function fingerprint(t) { return [t.date,String(t.description).trim().toLowerCase().replace(/\s+/g,' '),t.debit,t.credit,String(t.account || '').trim().toLowerCase(),t.currency||'INR',amountsResolved(t)?'':JSON.stringify(t.rawValues||t.sourceRow||[])].join('|'); }
 export function dimension(t, key, data) {
   if(key === 'date') return t.date;
   if(key === 'month') return t.date.slice(0,7);
@@ -98,7 +102,7 @@ export function dimension(t, key, data) {
   return t.account || 'Default account';
 }
 export const measure = (t,key) => key === 'final' ? finalDebit(t) : key === 'count' ? 1 : t[key] || 0;
-export function reportRows(data, report) { return data.transactions.filter(t => (t.currency||'INR')===(report.currency||data.settings.currency) && (!report.from || t.date >= report.from) && (!report.to || t.date <= report.to) && (!report.categories?.length || report.categories.includes(t.categoryId))); }
+export function reportRows(data, report) { return data.transactions.filter(t => !t.needsReview && amountsResolved(t) && (t.currency||'INR')===(report.currency||data.settings.currency) && (!report.from || t.date >= report.from) && (!report.to || t.date <= report.to) && (!report.categories?.length || report.categories.includes(t.categoryId))); }
 export function pivot(data, report) {
   const cells=new Map(), rows=new Set(), cols=new Set();
   for (const t of reportRows(data,report)) {
@@ -108,7 +112,7 @@ export function pivot(data, report) {
   return {rows:[...rows].sort(),columns:[...cols].sort(),get:(r,c)=>cells.get(JSON.stringify([r,c]))||0};
 }
 export function actual(data,categoryId,period) {
-  return data.transactions.filter(t=>(t.currency||'INR')===data.settings.currency && t.date.startsWith(period) && (!categoryId || t.categoryId===categoryId) && categoryRole(data,t.categoryId)==='expense').reduce((s,t)=>s+finalDebit(t),0);
+  return data.transactions.filter(t=>!t.needsReview && amountsResolved(t) && (t.currency||'INR')===data.settings.currency && t.date.startsWith(period) && (!categoryId || t.categoryId===categoryId) && categoryRole(data,t.categoryId)==='expense').reduce((s,t)=>s+finalDebit(t),0);
 }
 export function planned(data,categoryId,period) {
   return data.budgets.filter(b=>(b.currency||'INR')===data.settings.currency && b.categoryId===categoryId && (b.period===period || (period.length===4 && b.period.startsWith(period+'-')))).reduce((s,b)=>s+b.amount,0);
@@ -132,7 +136,8 @@ export function projection(m, base = today()) {
   return {months,projected,required,gap:Math.max(0,required-projected)};
 }
 export function exportTransactions(data) {
-  return toCSV([['Date','Month','Year','Description','Type','Category','Subcategory','Account','Currency','Debit','Final debit','Credit'],...data.transactions.map(t=>[t.date,t.date.slice(0,7),t.date.slice(0,4),t.description,dimension(t,'type',data),dimension(t,'category',data),t.subcategory,t.account,t.currency||'INR',t.debit/100,finalDebit(t)/100,t.credit/100])]);
+  const amount=(t,k)=>Number.isFinite(k==='final'?finalDebit(t):t[k])?(k==='final'?finalDebit(t):t[k])/100:(t.rawValues?.[k]??'');
+  return toCSV([['Date','Month','Year','Description','Type','Category','Subcategory','Account','Currency','Review status','Raw values','Debit','Final debit','Credit'],...data.transactions.map(t=>[t.date||t.rawValues?.date||'',t.date.slice(0,7),t.date.slice(0,4),t.description,dimension(t,'type',data),dimension(t,'category',data),t.subcategory,t.account,t.currency||'INR',t.needsReview?'Needs review':'Ready',t.rawValues?JSON.stringify(t.rawValues):'',amount(t,'debit'),amount(t,'final'),amount(t,'credit')])]);
 }
 export function validateData(data) {
   if(data?.version!==1 || !data.settings || !['types','categories','transactions','budgets','reports','family','milestones','imports'].every(k=>Array.isArray(data[k]))) throw new Error('This is not a supported Pocket Ledger backup.');
@@ -140,8 +145,8 @@ export function validateData(data) {
   for(const group of ['types','categories','transactions','budgets','reports','family','milestones']) { const ids=data[group].map(x=>x.id); if(ids.some(x=>typeof x!=='string') || new Set(ids).size!==ids.length)throw new Error('Invalid backup identifiers.'); }
   if(data.types.some(t=>!['expense','income','transfer'].includes(t.role) || typeof t.name!=='string'))throw new Error('Invalid transaction types.');
   if(data.categories.some(c=>typeof c.name!=='string'||!Array.isArray(c.subs)||!c.subs.every(s=>typeof s==='string')||!data.types.some(t=>t.id===c.typeId)))throw new Error('Invalid categories.');
-  // Keep older backups readable; new/edited transactions require a subcategory.
-  if(data.transactions.some(t=>transactionError(t,data,{requireSubcategory:false})))throw new Error('The backup contains invalid transactions.');
+  // Imported unresolved rows retain their source values. Legacy v1 data remains readable.
+  if(data.transactions.some(t=>t.needsReview ? typeof t.date!=='string'||typeof t.description!=='string'||!t.rawValues||![t.debit,t.credit,t.adjustment].every(n=>n===null||Number.isSafeInteger(n)) : transactionError(t,data)))throw new Error('The backup contains invalid transactions.');
   if(data.budgets.some(b=>!/^\d{4}(-(?:0[1-9]|1[0-2]))?$/.test(b.period)||!Number.isSafeInteger(b.amount)||b.amount<0||!data.categories.some(c=>c.id===b.categoryId)))throw new Error('Invalid budget data.');
   if(data.family.some(f=>!normalizeDate(f.birthDate)||typeof f.name!=='string'))throw new Error('Invalid family data.');
   if(data.reports.some(r=>typeof r.name!=='string'||!['line','bar','donut','pivot'].includes(r.type)||!['final','debit','credit','count'].includes(r.measure)||!['date','month','year','category','subcategory','type','account'].includes(r.dimension)||!['','date','month','year','category','subcategory','type','account'].includes(r.column)||!Array.isArray(r.categories)||r.categories.some(id=>!data.categories.some(c=>c.id===id))||(r.from&&!normalizeDate(r.from))||(r.to&&!normalizeDate(r.to))))throw new Error('Invalid report data.');

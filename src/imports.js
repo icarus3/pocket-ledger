@@ -1,26 +1,37 @@
 import {unzipSync,strFromU8} from 'fflate';
 import {parseCSV,normalizeDate,moneyInput,uid,matchSubcategory,resolveClassification} from './core.js';
 const xml=text=>{const doc=new DOMParser().parseFromString(text,'application/xml');if(doc.querySelector('parsererror'))throw new Error('The spreadsheet contains invalid XML.');return doc;};
+const elements=(node,name)=>node ? [...node.getElementsByTagNameNS('*',name)] : [];
+const first=(node,name)=>elements(node,name)[0];
+const workbookPath=target=>{
+  const parts=[];
+  for(const part of (target.startsWith('/')?target.slice(1):'xl/'+target).replaceAll('\\','/').split('/')) {
+    if(part==='..')parts.pop();else if(part&&part!=='.')parts.push(part);
+  }
+  return parts.join('/');
+};
 export function readXLSX(bytes) {
   let total=0;
   const files=unzipSync(bytes,{filter:entry=>{total+=entry.originalSize;if(total>60*1024*1024)throw new Error('This expanded workbook exceeds 60 MB. Please import a smaller workbook.');return /\.xml$|\.rels$/.test(entry.name);}});
   const read=name=>files[name]?xml(strFromU8(files[name])):null;
   const workbook=read('xl/workbook.xml'), rels=read('xl/_rels/workbook.xml.rels');
   if(!workbook||!rels)throw new Error('This file is not a supported .xlsx workbook.');
-  const shared=[...(read('xl/sharedStrings.xml')?.querySelectorAll('si')||[])].map(si=>[...si.querySelectorAll('t')].map(t=>t.textContent).join(''));
-  const date1904=['1','true'].includes(workbook.querySelector('workbookPr')?.getAttribute('date1904'));
-  return [...workbook.querySelectorAll('sheet')].map(sheet=>{
-    const id=sheet.getAttribute('r:id');
-    const target=[...rels.querySelectorAll('Relationship')].find(r=>r.getAttribute('Id')===id)?.getAttribute('Target');
-    const path=target?.startsWith('/')?target.slice(1):'xl/'+target;
-    const doc=read(path.replace(/^xl\/\.\//,'xl/'));
-    const rows=[...(doc?.querySelectorAll('sheetData > row')||[])].map(row=>{
+  const shared=elements(read('xl/sharedStrings.xml'),'si').map(si=>elements(si,'t').map(t=>t.textContent).join(''));
+  const date1904=['1','true'].includes(first(workbook,'workbookPr')?.getAttribute('date1904'));
+  return elements(workbook,'sheet').map(sheet=>{
+    const id=[...sheet.attributes].find(a=>a.localName==='id')?.value;
+    const relationship=elements(rels,'Relationship').find(r=>r.getAttribute('Id')===id);
+    const target=relationship?.getAttribute('Target');
+    if(!target||relationship.getAttribute('TargetMode')==='External')throw new Error('This workbook has an unsupported worksheet link. Save a local .xlsx copy.');
+    const doc=read(workbookPath(target));
+    if(!doc)throw new Error('The workbook is missing worksheet '+sheet.getAttribute('name')+'.');
+    const rows=elements(first(doc,'sheetData'),'row').map(row=>{
       const cells=[];
-      for(const c of row.querySelectorAll('c')) {
-        const letters=(c.getAttribute('r')||'A1').match(/[A-Z]+/)[0];let index=0;for(const ch of letters)index=index*26+ch.charCodeAt(0)-64;
+      for(const c of elements(row,'c')) {
+        const letters=(c.getAttribute('r')||'').toUpperCase().match(/[A-Z]+/)?.[0];let index=letters?0:cells.length+1;for(const ch of letters||'')index=index*26+ch.charCodeAt(0)-64;
         if(index>1000)throw new Error('This sheet has too many columns. Export just the statement table.');
-        const t=c.getAttribute('t'), value=c.querySelector('v')?.textContent || '';
-        cells[index-1]=t==='s'?shared[+value]||'':t==='inlineStr'?[...c.querySelectorAll('t')].map(n=>n.textContent).join(''):t==='b'?(value==='1'?'TRUE':'FALSE'):t==='str'||t==='d'?value:value!==''?Number(value):'';
+        const t=c.getAttribute('t'), value=first(c,'v')?.textContent || '';
+        cells[index-1]=t==='s'?shared[+value]||'':t==='inlineStr'?elements(c,'t').map(n=>n.textContent).join(''):t==='b'?(value==='1'?'TRUE':'FALSE'):t==='str'||t==='d'||t==='e'?value:value!==''?Number(value):first(c,'f')?'='+first(c,'f').textContent:'';
       }
       return Array.from({length:cells.length},(_,i)=>cells[i]??'');
     }).filter(row=>row.some(v=>v!==''));
@@ -95,9 +106,12 @@ export function mapTransactions(rows,mapping,{dateFormat='DMY',account='',defaul
       if(!Number.isFinite(amount))debit=NaN;
     }
     const subcategory=String(get(row,'subcategory')).trim();
-    const classification=subcategory ? matchSubcategory(categories,subcategory,get(row,'category')) : resolveClassification(categories,defaultSubcategory);
+    const parent=categories.find(c=>c.name.trim().toLowerCase()===String(get(row,'category')).trim().toLowerCase());
+    const classification=subcategory ? matchSubcategory(categories,subcategory,get(row,'category')) : resolveClassification(categories,defaultSubcategory)|| (parent?{categoryId:parent.id,subcategory:''}:null);
     const adjustment=mapping.final>=0 && String(get(row,'final')).trim()!=='' ? moneyInput(get(row,'final'))-debit+credit : 0;
     let dateValue=get(row,'date');if(date1904 && typeof dateValue==='number')dateValue+=1462;
-    return {id:uid(),date:normalizeDate(dateValue,dateFormat),description:String(get(row,'description')),debit,credit,adjustment,categoryId:classification?.categoryId||'',subcategory:classification?.subcategory||subcategory,account:String(get(row,'account')||account),sourceRow:row,include:true};
+    const rawValues=Object.fromEntries(Object.keys(aliases).map(k=>[k,get(row,k)]));
+    const safe=n=>Number.isSafeInteger(n)&&Math.abs(n)<1e14?n:null;
+    return {id:uid(),date:normalizeDate(dateValue,dateFormat),description:String(get(row,'description')),debit:safe(debit),credit:safe(credit),adjustment:safe(adjustment),categoryId:classification?.categoryId||'',subcategory:classification?.subcategory||subcategory,account:String(get(row,'account')||account),rawValues,sourceRow:row,include:true};
   });
 }
