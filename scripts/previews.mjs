@@ -5,7 +5,7 @@ import path from 'node:path';
 
 await fs.mkdir('previews/screens',{recursive:true});
 await fs.mkdir('previews/images',{recursive:true});
-const css=await fs.readFile('src/styles.css','utf8');
+const css=(await fs.readFile('src/styles.css','utf8'))+'\n'+(await fs.readFile('src/planning.css','utf8'));
 const license=await fs.readFile('node_modules/fflate/LICENSE','utf8');
 const compiled=await build({entryPoints:['src/app.js'],bundle:true,format:'iife',target:'chrome110',write:false,minify:true,legalComments:'none'});
 await fs.writeFile('previews/interactive-demo.html',`<!doctype html><html lang="en" data-preview="true"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Pocket Ledger · Interactive tablet preview</title><style>${css}</style></head><body><!-- Third-party runtime: fflate 0.8.3\n${license}\n--><div id="app"></div><dialog id="modal"></dialog><div id="toast" role="status"></div><script>${compiled.outputFiles[0].text.replaceAll('</script','<\\/script')}</script></body></html>`);
@@ -14,7 +14,7 @@ const browser=await chromium.launch({executablePath:process.env.CHROME_PATH||'C:
 const page=await browser.newPage({viewport:{width:1280,height:800},deviceScaleFactor:1,locale:'en-GB'});
 const errors=[];page.on('pageerror',e=>errors.push(e.message));
 const screens=[];
-const labels={dashboard:'Overview',transactions:'Transactions',imports:'Import a statement',categories:'Categories & subcategories',reports:'Charts & pivot tables',budgets:'Budget comparison',timeline:'Money Timeline',settings:'Settings & security'};
+const labels={dashboard:'Overview',transactions:'Transactions',imports:'Import a statement',categories:'Categories & subcategories',reports:'Charts & pivot tables',budgets:'Budget comparison',valuation:'Valuation & pivot',investments:'Investment plan','home-loan':'Home loan',timeline:'Money Timeline',settings:'Settings & security'};
 async function capture(key,label) {
   await page.locator('#toast').evaluate(t=>t.classList.remove('show'));
   const modalOpen=await page.locator('#modal').evaluate(d=>d.open);
@@ -39,7 +39,9 @@ async function capture(key,label) {
 await page.goto('http://127.0.0.1:4173/?demo=1');await page.locator('h1').waitFor();
 for(const view of Object.keys(labels)) {await page.locator(`.sidebar [data-view="${view}"]`).click();await capture(view,labels[view]);}
 await page.locator('.sidebar [data-view="budgets"]').click();await page.locator('[data-action=budget-year]').click();await capture('budget-yearly','Yearly budget & historical comparison');
+await page.locator('.sidebar [data-view="investments"]').click();await page.locator('[data-action=planning-investment-year]').click();await capture('investments-yearly','Investment plan · yearly amounts');
 const forms=[['settings','change-pin','pin-setup','Choose a four-digit PIN without losing data'],['transactions','add-transaction','transaction-form','Transaction entry & final debit'],['categories','add-category','category-form','Custom category & subcategory form'],['reports','add-report','report-form','Editable chart & pivot builder'],['budgets','add-budget','budget-form','Monthly / annual budget form'],['timeline','add-family','family-form','Family member & age form'],['timeline','add-milestone','milestone-form','Future milestone & return assumptions']];
+forms.push(['valuation','planning-add-valuation','valuation-form','Monthly account valuation'],['investments','planning-add-investment','investment-form','Investment option and monthly plan'],['investments','planning-actual','investment-actual','Record actual monthly investment'],['home-loan','planning-add-cost','loan-cost-form','Home loan component costs'],['home-loan','planning-add-repayment','loan-repayment-form','Home loan repayment schedule'],['home-loan','planning-add-status','loan-status-form','Dated home loan status']);
 for(const [view,action,key,label]of forms) {
   await page.locator(`.sidebar [data-view="${view}"]`).click();await page.locator(`[data-action="${action}"]`).first().click();
   if(key==='transaction-form'){await page.locator('#modal [name=description]').fill('Weekly grocery shop');await page.locator('#modal [name=subcategory]').selectOption(JSON.stringify(['food','Groceries']));await page.locator('#modal [name=debit]').fill('2850');await page.locator('#modal [name=final]').fill('2700');}
@@ -47,6 +49,7 @@ for(const [view,action,key,label]of forms) {
   if(key==='milestone-form'){await page.locator('#modal [name=name]').fill('Aarav’s university');await page.locator('#modal [name=date]').fill('2035-07-01');await page.locator('#modal [name=target]').fill('3500000');await page.locator('#modal [name=saved]').fill('600000');await page.locator('#modal [name=monthly]').fill('18000');await page.locator('#modal [name=rate]').fill('7');await page.locator('#modal [name=inflation]').fill('5');}
   await capture(key,label);await page.locator('#modal [data-action=close-modal]').first().click();
 }
+await page.locator('.sidebar [data-view="valuation"]').click();await page.locator('.planning-options summary').click();await page.locator('[data-action=planning-add-option]').first().click();await capture('valuation-options','Manage account types, subtypes and valuation categories');await page.locator('#modal [data-action=close-modal]').first().click();
 await page.locator('.sidebar [data-view=imports]').click();await page.locator('#statement-file').setInputFiles('samples/statement.csv');await page.locator('#map-form').waitFor();await capture('import-mapping','Match bank statement columns');await page.locator('#map-form [type=submit]').click();await page.locator('.review').waitFor();await capture('import-review','Editable statement review');
 await page.locator('[data-action=reset-import]').click();
 await page.locator('#statement-file').setInputFiles({name:'review-later.csv',mimeType:'text/csv',buffer:Buffer.from('Date,Description,Debit,Final debit,Credit\n01/10/2026,Needs amount review,unresolved,1.234,0\n02/10/2026,Ready to import,250,245,0')});await page.locator('#map-form [type=submit]').click();await page.locator('.review').waitFor();await capture('review-later','Import now and review unresolved amounts later');

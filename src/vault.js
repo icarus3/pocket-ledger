@@ -1,7 +1,9 @@
 import {validateData} from './core.js';
 const enc=new TextEncoder(), dec=new TextDecoder();
-const b64=bytes=>{let s='';for(const b of bytes)s+=String.fromCharCode(b);return btoa(s);};
-const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+// Bounded chunks avoid millions of one-character strings and whole-payload
+// binary-string copies when saving a large ledger. These remain standard base64.
+const b64=bytes=>{const parts=[];for(let i=0;i<bytes.length;i+=24576)parts.push(btoa(String.fromCharCode(...bytes.subarray(i,i+24576))));return parts.join('');};
+const unb64=s=>{if(typeof s!=='string'||s.length%4)throw new Error('Invalid encrypted data.');const padding=s.endsWith('==')?2:s.endsWith('=')?1:0,bytes=new Uint8Array(s.length/4*3-padding);let offset=0;for(let i=0;i<s.length;i+=32768){const chunk=atob(s.slice(i,i+32768));for(let j=0;j<chunk.length;j++)bytes[offset++]=chunk.charCodeAt(j);}return bytes;};
 const ITERATIONS=600000;
 async function derive(password,salt,iterations=ITERATIONS) {
   const material=await crypto.subtle.importKey('raw',enc.encode(password),'PBKDF2',false,['deriveKey']);
@@ -9,7 +11,8 @@ async function derive(password,salt,iterations=ITERATIONS) {
 }
 export async function encrypt(data,key,salt,iterations=ITERATIONS,protection=null) {
   const iv=crypto.getRandomValues(new Uint8Array(12));
-  const ciphertext=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:enc.encode('PocketLedger:v1')},key,enc.encode(JSON.stringify(data)));
+  const bytes=enc.encode(JSON.stringify(data));let ciphertext;
+  try{ciphertext=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:enc.encode('PocketLedger:v1')},key,bytes);}finally{bytes.fill(0);}
   return protection ? {format:'PocketLedger',version:2,protection,iv:b64(iv),ciphertext:b64(new Uint8Array(ciphertext))} : {format:'PocketLedger',version:1,kdf:'PBKDF2-SHA256',iterations,salt:b64(salt),iv:b64(iv),ciphertext:b64(new Uint8Array(ciphertext))};
 }
 export async function unlock(envelope,password,mode='pin') {
@@ -70,5 +73,49 @@ async function db() {
   database=await new Promise((resolve,reject)=>{const r=indexedDB.open('pocket-ledger-secure',1);r.onupgradeneeded=()=>r.result.createObjectStore('vault');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});
   return database;
 }
-export async function readEnvelope() {const d=await db();return new Promise((resolve,reject)=>{const r=d.transaction('vault').objectStore('vault').get('primary');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
-export async function writeEnvelope(envelope) {const d=await db();await new Promise((resolve,reject)=>{const tx=d.transaction('vault','readwrite');tx.objectStore('vault').put(envelope,'primary');tx.oncomplete=resolve;tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error);});}
+// Chromium limits the serialized size of a single IndexedDB value. Ciphertext
+// chunks keep large ledgers below that limit without changing AES envelopes or
+// exported backup files. All chunks and their manifest commit atomically.
+const STORAGE_CHUNK=4*1024*1024;
+const chunkKey=(key,index)=>`${key}:ciphertext:${index}`;
+function deleteStored(store,key){store.delete(key);store.delete(IDBKeyRange.bound(`${key}:ciphertext:`,`${key}:ciphertext:\uffff`));}
+function putStored(store,key,value){
+  deleteStored(store,key);
+  const record={...value};delete record._ciphertextChunks;
+  if(value.ciphertext.length<=STORAGE_CHUNK){store.put(record,key);return;}
+  const count=Math.ceil(value.ciphertext.length/STORAGE_CHUNK);
+  record.ciphertext='';record._ciphertextChunks={count,length:value.ciphertext.length};store.put(record,key);
+  for(let i=0;i<count;i++)store.put(value.ciphertext.slice(i*STORAGE_CHUNK,(i+1)*STORAGE_CHUNK),chunkKey(key,i));
+}
+async function readStored(key,accept=()=>true){
+  const d=await db();return new Promise((resolve,reject)=>{
+    const tx=d.transaction('vault'),store=tx.objectStore('vault'),request=store.get(key);let record,parts,error;
+    request.onsuccess=()=>{
+      record=request.result;if(!record||!accept(record)){record=undefined;return;}
+      const manifest=record._ciphertextChunks;if(!manifest)return;
+      if(!Number.isSafeInteger(manifest.count)||manifest.count<1||manifest.count>2048||!Number.isSafeInteger(manifest.length)||Math.ceil(manifest.length/STORAGE_CHUNK)!==manifest.count){error=new Error('The encrypted vault has an invalid storage manifest.');return;}
+      parts=new Array(manifest.count);
+      for(let i=0;i<manifest.count;i++){const r=store.get(chunkKey(key,i));r.onsuccess=()=>{if(typeof r.result!=='string'||r.result.length>STORAGE_CHUNK)error=new Error('The encrypted vault is missing stored ciphertext.');else parts[i]=r.result;};}
+    };
+    tx.oncomplete=()=>{if(error){reject(error);return;}if(parts){const ciphertext=parts.join('');if(ciphertext.length!==record._ciphertextChunks.length){reject(new Error('The encrypted vault is missing stored ciphertext.'));return;}record={...record,ciphertext};delete record._ciphertextChunks;}resolve(record);};
+    tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error);
+  });
+}
+export async function readEnvelope() {return readStored('primary');}
+export async function writeEnvelope(envelope) {const d=await db();await new Promise((resolve,reject)=>{const tx=d.transaction('vault','readwrite'),store=tx.objectStore('vault');let failure;tx.oncomplete=resolve;tx.onerror=()=>reject(failure||tx.error);tx.onabort=()=>reject(failure||tx.error);try{deleteStored(store,'workspace');putStored(store,'primary',envelope);}catch(error){failure=error;try{tx.abort();}catch{}reject(error);}});}
+// Draft-only saves use the active nonextractable data key. Binding them to the
+// primary IV prevents an old queued draft from being applied after a data save,
+// credential change or restore. The primary envelope and backup format stay intact.
+export async function writeWorkspace(snapshot,current,baseEnvelope) {
+  if(!snapshot||typeof snapshot!=='object'||Array.isArray(snapshot))throw new Error('Invalid workspace progress.');
+  const iv=crypto.getRandomValues(new Uint8Array(12)),bytes=enc.encode(JSON.stringify(snapshot));let sealed;
+  try{sealed=await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:enc.encode('PocketLedger:workspace:v1')},current.key,bytes);}finally{bytes.fill(0);}
+  const record={baseIv:baseEnvelope.iv,iv:b64(iv),ciphertext:b64(new Uint8Array(sealed))},d=await db();
+  return new Promise((resolve,reject)=>{const tx=d.transaction('vault','readwrite'),store=tx.objectStore('vault'),request=store.get('primary');let saved=false,failure;request.onsuccess=()=>{if(request.result?.iv===record.baseIv){try{putStored(store,'workspace',record);saved=true;}catch(error){failure=error;try{tx.abort();}catch{}reject(error);}}};tx.oncomplete=()=>resolve(saved);tx.onerror=()=>reject(failure||tx.error);tx.onabort=()=>reject(failure||tx.error);});
+}
+export async function readWorkspace(current,baseEnvelope) {
+  const record=await readStored('workspace',stored=>stored.baseIv===baseEnvelope.iv);
+  if(!record)return undefined;
+  try{const plain=await crypto.subtle.decrypt({name:'AES-GCM',iv:unb64(record.iv),additionalData:enc.encode('PocketLedger:workspace:v1')},current.key,unb64(record.ciphertext));const snapshot=JSON.parse(dec.decode(plain));if(!snapshot||typeof snapshot!=='object'||Array.isArray(snapshot))throw new Error();return snapshot;}
+  catch{throw new Error('Saved progress could not be decrypted. Your encrypted ledger has not been changed.');}
+}

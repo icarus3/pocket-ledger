@@ -1,7 +1,8 @@
 import * as C from './core.js';
 import * as Vault from './vault.js';
+import * as Planning from './planning.js';
 import {demoData} from './demo.js';
-import {readFile,autoMap,mapTransactions} from './imports.js';
+import {readFile,autoMap,mapTransactions,MAX_STATEMENT_ROWS} from './imports.js';
 import {esc,icon,money,amountValue,dateLabel,monthLabel,option,button,empty,stat,chart} from './ui.js';
 
 const app=document.querySelector('#app'), modal=document.querySelector('#modal');
@@ -9,18 +10,28 @@ let demo=new URLSearchParams(location.search).has('demo') || document.documentEl
 let session=null, envelope=null, view='dashboard', modalState={}, importState=null, importReview=[], categoryUpload=null;
 let period=C.today().slice(0,7),budgetMode='month',budgetYear=C.today().slice(0,4),budgetMonth=C.today().slice(5,7),compareYear=String(+budgetYear-1);
 let txSearch='',txCategory='',txFrom='',txTo='',txPage=0,saveQueue=Promise.resolve(),lastActivity=Date.now(),locking=false,authBusy=false,lockRequested=false;
-let rendering=false,lockedAppearance='system';
+let rendering=false,lockedAppearance='system',reviewPage=0,planningUI={},workspaceRevision=0,savedWorkspaceRevision=-1,workspaceTimer,importBusy=false;
 try{lockedAppearance=localStorage.getItem('pocket-ledger-appearance')||'system';}catch{}
 let categoryWorkbook=null,authRecovery=false,authFailures=0,authRetryAt=0,lastWorkspace='',suspendedDraft=null;
-const draftKinds=['transaction','category','type','report','budget','family','milestone','category-import'];
+const draftKinds=['transaction','category','type','report','budget','family','milestone','category-import',...Planning.planningDraftKinds];
 function formValues(form){return form?[...form.elements].filter(e=>e.name&&!['password','file','submit'].includes(e.type)).map(e=>({name:e.name,value:e.value,checked:e.checked})):[];}
 function applyValues(form,values=[]){for(const item of values){const e=[...form.elements].find(e=>e.name===item.name&&(e.type!=='checkbox'||e.value===item.value));if(e){e.value=item.value;if(e.type==='checkbox')e.checked=item.checked;}}}
 function captureWorkspace(){
-  return {view,importState,importReview,categoryWorkbook,period,budgetMode,budgetYear,budgetMonth,compareYear,txSearch,txCategory,txFrom,txTo,txPage,
+  // Each reviewed row already retains its original sourceRow. Store those cells
+  // once in large drafts, then reconstruct the mapping worksheet on unlock.
+  const savedImport=importReview.length>=10000&&importState?{...importState,sheets:importState.sheets.map((sheet,i)=>i===(importState.sheetIndex||0)?{...sheet,rows:sheet.rows.slice(0,(importState.headerIndex||0)+1),reviewSource:true}:sheet)}:importState;
+  return {view,importState:savedImport,importReview,reviewPage,planningUI,categoryWorkbook,period,budgetMode,budgetYear,budgetMonth,compareYear,txSearch,txCategory,txFrom,txTo,txPage,
     modal:modal.open&&draftKinds.includes(modalState.kind)&&!modal.querySelector('form')?.dataset.submitting?{kind:modalState.kind,id:modalState.id,adjustment:modalState.adjustment,values:formValues(modal.querySelector('form'))}:suspendedDraft};
 }
 async function saveWorkspace(){
+  clearTimeout(workspaceTimer);
   if(!session||demo||locking)return;
+  if(D().transactions.length>=10000||importReview.length>=10000||importState?.sheets?.some(s=>s.rows.length>=10000)){
+    if(savedWorkspaceRevision===workspaceRevision)return;
+    const current=session,revision=workspaceRevision,snapshot=captureWorkspace();
+    const task=saveQueue.then(async()=>{if(current!==session)return;if(!await Vault.writeWorkspace(snapshot,current,envelope))throw new Error('The vault changed before progress could be saved. Try again.');current.data.workspace=snapshot;savedWorkspaceRevision=revision;});
+    saveQueue=task.catch(()=>{});await task;return;
+  }
   const snapshot=structuredClone(captureWorkspace()),serialized=JSON.stringify(snapshot);
   if(lastWorkspace===serialized)return;
   await mutate(d=>{d.workspace=snapshot;},'');lastWorkspace=serialized;
@@ -28,11 +39,13 @@ async function saveWorkspace(){
 function restoreWorkspace(){
   const w=D().workspace||{};
   view=viewLabels[w.view]?w.view:'dashboard';importState=w.importState||null;importReview=w.importReview||[];categoryWorkbook=w.categoryWorkbook||null;
+  if(importReview.length&&importState){const sheet=importState.sheets[importState.sheetIndex||0];if(sheet?.reviewSource){sheet.rows=sheet.rows.concat(importReview.map(row=>row.sourceRow));delete sheet.reviewSource;}}
   ({period=period,budgetMode=budgetMode,budgetYear=budgetYear,budgetMonth=budgetMonth,compareYear=compareYear,txSearch='',txCategory='',txFrom='',txTo='',txPage=0}=w);
+  reviewPage=w.reviewPage||0;planningUI=w.planningUI||{};workspaceRevision++;savedWorkspaceRevision=-1;
   render();
   const m=w.modal,editors={transaction:transactionModal,category:categoryModal,type:typeModal,report:reportModal,budget:budgetModal,family:familyModal,milestone:milestoneModal,'category-import':renderCategoryUpload};
-  if(m&&editors[m.kind]){editors[m.kind](m.id);applyValues(modal.querySelector('form'),m.values);if(m.adjustment!==undefined)modalState.adjustment=m.adjustment;}
-  lastWorkspace=JSON.stringify(captureWorkspace());
+  if(m&&(editors[m.kind]||Planning.planningDraftKinds.includes(m.kind))){if(editors[m.kind])editors[m.kind](m.id);else Planning.planningEditor(m.kind,m.id,planningContext());applyValues(modal.querySelector('form'),m.values);if(Planning.planningDraftKinds.includes(m.kind))Planning.restorePlanningDraft(modal.querySelector('form'),m.values,planningContext());if(m.adjustment!==undefined)modalState.adjustment=m.adjustment;}
+  lastWorkspace=D().transactions.length>=10000||importReview.length>=10000?'':JSON.stringify(captureWorkspace());
 }
 const selectedFamily=()=>D().family.filter(f=>!Array.isArray(D().settings.timelineMembers)||D().settings.timelineMembers.includes(f.id));
 function applyAppearance(){const setting=session?.data.settings.appearance||lockedAppearance;if(session&&!demo){lockedAppearance=setting;try{localStorage.setItem('pocket-ledger-appearance',setting);}catch{}}document.documentElement.dataset.theme=setting==='system'?((window.AndroidBridge?.isSystemDark?.()??matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light'):setting;window.AndroidBridge?.setDarkAppearance?.(document.documentElement.dataset.theme==='dark');}
@@ -47,7 +60,7 @@ const selectedSubcategory=t=>C.resolveClassification(D().categories,C.classifica
 const currencyOptions=selected=>['INR','CHF','USD'].map(c=>option(c,c,selected)).join('');
 const dimOptions=selected=>['date','month','year','category','subcategory','type','account'].map(d=>option(d,d[0].toUpperCase()+d.slice(1),selected)).join('');
 const categoryName=id=>D().categories.find(c=>c.id===id)?.name||'Uncategorized';
-const navItems=[['dashboard','Overview','grid'],['transactions','Transactions','rows'],['imports','Import statements','upload'],['categories','Categories','tag'],['reports','Charts & pivots','chart'],['budgets','Budgets','budget'],['timeline','Money Timeline','timeline']];
+const navItems=[['dashboard','Overview','grid'],['transactions','Transactions','rows'],['imports','Import statements','upload'],['categories','Categories','tag'],['reports','Charts & pivots','chart'],['budgets','Budgets','budget'],['valuation','Valuation','wallet'],['investments','Investment plan','chart'],['home-loan','Home loan','home'],['timeline','Money Timeline','timeline']];
 const viewLabels=Object.fromEntries([...navItems,['settings','Settings & security','settings']].map(v=>[v[0],v[1]]));
 const field=(label,name,type='text',value='',extra='')=>`<label class="field">${esc(label)}<input name="${name}" type="${type}" value="${esc(value)}" ${extra}></label>`;
 const select=(label,name,options,extra='')=>`<label class="field">${esc(label)}<select name="${name}" ${extra}>${options}</select></label>`;
@@ -57,7 +70,9 @@ async function mutate(callback,message='Saved to your encrypted vault') {
   const current=session;
   const task=saveQueue.then(async()=>{
     if(!current || current!==session)throw new Error('Unlock your vault to make this change.');
-    const next=structuredClone(current.data);next.workspace=structuredClone(captureWorkspace());callback(next);
+    // Transaction objects are copied only by their editors. Copying the array keeps
+    // a failed save isolated without duplicating half a million unchanged rows.
+    const next={...structuredClone({...current.data,transactions:[],workspace:null}),transactions:current.data.transactions.slice()};next.workspace=captureWorkspace();callback(next);
     if(!demo){const sealed=await Vault.encrypt(next,current.key,current.salt,current.iterations,current.protection);await Vault.writeEnvelope(sealed);envelope=sealed;}
     current.data=next;
   });
@@ -68,7 +83,7 @@ async function lock() {
   if(demo || locking)return;
   try{await saveWorkspace();await saveQueue;}catch(error){toast('Could not save progress: '+error.message);return;}
   locking=true;
-  modal.close();modal.innerHTML='';importState=null;importReview=[];categoryUpload=null;categoryWorkbook=null;suspendedDraft=null;modalState={};session=null;lastWorkspace='';
+  clearTimeout(workspaceTimer);planningUI={};modal.close();modal.innerHTML='';importState=null;importReview=[];categoryUpload=null;categoryWorkbook=null;suspendedDraft=null;modalState={};session=null;lastWorkspace='';
   txSearch='';txCategory='';txFrom='';txTo='';renderAuth();locking=false;
 }
 function renderAuth() {
@@ -83,10 +98,11 @@ function render() {
   if(!session){renderAuth();return;}
   rendering=true;
   const name=viewLabels[view]||'Overview';
-  app.innerHTML=`<div class="layout"><aside class="sidebar"><div class="brand"><div class="logo">${icon('leaf')}</div><span>Pocket Ledger</span></div><div class="nav-label">YOUR PERSONAL SPACE</div><nav class="nav" aria-label="Main navigation">${navItems.map(([id,label,glyph])=>`<button data-view="${id}" class="${view===id?'active':''}" title="${label}" ${view===id?'aria-current="page"':''}>${icon(glyph)}<span>${label}</span></button>`).join('')}</nav><div class="sidebar-bottom"><nav class="nav"><button data-view="settings" class="${view==='settings'?'active':''}" title="Settings & security">${icon('settings')}<span>Settings & security</span></button></nav><div class="local-note"><strong>${icon('lock')} ${demo?'Sample data preview':'Private by design'}</strong>${demo?'Try every screen. Changes in this preview are temporary.':'Encrypted on this device.<br>No cloud. Just you.'}</div><div class="profile"><div class="avatar">PL</div><div><strong>My personal ledger</strong><small>${demo?'Preview workspace':'Local workspace'}</small></div><button data-action="${demo?'exit-demo':'lock'}" aria-label="${demo?'Exit preview':'Lock vault'}">${icon('lock')}</button></div></div></aside><main class="main">${demo?'<div class="demo-banner"><span>DESIGN PREVIEW · Fictional family and sample transactions</span><button data-action="exit-demo">Use my own ledger →</button></div>':''}<header class="topbar"><div class="crumb"><button class="mobile-toggle" data-action="menu" aria-label="Open navigation">${icon('menu')}</button><span>My workspace</span><span>/</span><b>${name}</b></div><div class="top-actions"><span class="status">${demo?'Preview · not saved':'Encrypted locally'}</span><select id="currency-select" aria-label="Active currency">${currencyOptions(currency())}</select><button class="icon-btn" data-action="${demo?'exit-demo':'lock'}" aria-label="${demo?'Exit preview':'Lock vault'}">${icon('lock')}</button></div></header><div class="content">${({dashboard:renderDashboard,transactions:renderTransactions,imports:renderImports,categories:renderCategories,reports:renderReports,budgets:renderBudgets,timeline:renderTimeline,settings:renderSettings}[view]||renderDashboard)()}</div></main></div>`;
+  app.innerHTML=`<div class="layout"><aside class="sidebar"><div class="brand"><div class="logo">${icon('leaf')}</div><span>Pocket Ledger</span></div><div class="nav-label">YOUR PERSONAL SPACE</div><nav class="nav" aria-label="Main navigation">${navItems.map(([id,label,glyph])=>`<button data-view="${id}" class="${view===id?'active':''}" title="${label}" ${view===id?'aria-current="page"':''}>${icon(glyph)}<span>${label}</span></button>`).join('')}</nav><div class="sidebar-bottom"><nav class="nav"><button data-view="settings" class="${view==='settings'?'active':''}" title="Settings & security">${icon('settings')}<span>Settings & security</span></button></nav><div class="local-note"><strong>${icon('lock')} ${demo?'Sample data preview':'Private by design'}</strong>${demo?'Try every screen. Changes in this preview are temporary.':'Encrypted on this device.<br>No cloud. Just you.'}</div><div class="profile"><div class="avatar">PL</div><div><strong>My personal ledger</strong><small>${demo?'Preview workspace':'Local workspace'}</small></div><button data-action="${demo?'exit-demo':'lock'}" aria-label="${demo?'Exit preview':'Lock vault'}">${icon('lock')}</button></div></div></aside><main class="main">${demo?'<div class="demo-banner"><span>DESIGN PREVIEW · Fictional family and sample transactions</span><button data-action="exit-demo">Use my own ledger →</button></div>':''}<header class="topbar"><div class="crumb"><button class="mobile-toggle" data-action="menu" aria-label="Open navigation">${icon('menu')}</button><span>My workspace</span><span>/</span><b>${name}</b></div><div class="top-actions"><span class="status">${demo?'Preview · not saved':'Encrypted locally'}</span><select id="currency-select" aria-label="Active currency">${currencyOptions(currency())}</select><button class="icon-btn" data-action="${demo?'exit-demo':'lock'}" aria-label="${demo?'Exit preview':'Lock vault'}">${icon('lock')}</button></div></header><div class="content">${({dashboard:renderDashboard,transactions:renderTransactions,imports:renderImports,categories:renderCategories,reports:renderReports,budgets:renderBudgets,timeline:renderTimeline,settings:renderSettings,valuation:()=>Planning.renderPlanning(view,D(),planningUI),investments:()=>Planning.renderPlanning(view,D(),planningUI),'home-loan':()=>Planning.renderPlanning(view,D(),planningUI)}[view]||renderDashboard)()}</div></main></div>`;
   rendering=false;
   const mappingForm=document.querySelector('#map-form');if(mappingForm)applyValues(mappingForm,importState?.mappingValues);
 }
+function planningContext(){return {data:D,ui:planningUI,mutate,render,open:(kind,id,title,body,options={})=>openModal(kind,title,body,{...options,id}),close:()=>{modal.close();modal.innerHTML='';modalState={};},toast,confirm:message=>window.confirm(message),download};}
 function transactionTable(transactions,compact=false) {
   if(!transactions.length)return empty('A fresh start','Add your first transaction or bring in a bank statement.','add-transaction','Add transaction','rows');
   return `<div class="table-wrap"><table class="${compact?'compact-ledger':'ledger-table'}"><thead><tr><th>Date</th><th>Transaction</th><th>Main category</th>${compact?'':'<th>Subcategory</th><th>Account</th>'}<th class="numeric">Debit</th><th class="numeric">Final debit</th><th class="numeric">Credit</th>${compact?'':'<th></th>'}</tr></thead><tbody>${transactions.map((t,i)=>`<tr><td>${dateLabel(t.date,D().settings.dateFormat)}</td><td><div class="description">${compact?`<span class="category-symbol ${i%3===1?'alt':i%3===2?'purple':''}">${icon(({home:'home',food:'food',travel:'travel',family:'family',pay:'wallet'})[t.categoryId]||'tag')}</span>`:''}<div><strong>${esc(t.description||t.rawValues?.description||'Imported row')}</strong>${t.needsReview?'<br><span class="tag orange">Needs review · excluded from totals</span>':''}${compact?`<br><small>${esc(t.subcategory||'Unassigned')}</small>`:''}</div></div></td><td>${compact?`<span class="tag ${i%3===1?'purple':i%3===2?'orange':''}">${esc(categoryName(t.categoryId))}</span>`:`<select data-tx="${esc(t.id)}" data-classification="category" aria-label="Category for ${esc(t.description)}">${option('','Uncategorized',t.categoryId)+categoryOptions(t.categoryId)}</select>`}</td>${compact?'':`<td><select data-tx="${esc(t.id)}" data-classification="subcategory" aria-label="Subcategory for ${esc(t.description)}">${subcategoryOptions(selectedSubcategory(t))}</select></td><td>${esc(t.account||'—')}</td>`}<td class="numeric">${t.debit===null?'Needs review':t.debit?cash(t.debit,2):'—'}</td><td class="numeric"><strong>${C.amountsResolved(t)?cash(C.finalDebit(t),2):'Needs review'}</strong></td><td class="numeric income">${t.credit===null?'Needs review':t.credit?cash(t.credit,2):'—'}</td>${compact?'':`<td><button class="icon-btn" data-action="edit-transaction" data-id="${esc(t.id)}" aria-label="Edit ${esc(t.description)}">${icon('edit')}</button></td>`}</tr>`).join('')}</tbody></table></div>`;
@@ -132,13 +148,14 @@ function renderImports() {
   const stage=importReview.length?3:importState?2:1;
   const steps=`<div class="steps">${['Choose a statement','Match the columns','Review & finalize'].map((s,i)=>`<div class="step ${stage===i+1?'active':''}"><span>${i+1}</span>${s}</div>`).join('')}</div>`;
   const title=head('A SIMPLE WAY TO BEGIN','Bring your money into focus.','Import a statement now and review any unresolved values when you are ready.',stage>1?button('reset-import','Start over','upload','secondary'):'');
-  if(stage===1)return title+steps+`<div class="grid import-layout"><section class="card"><div class="card-head"><div><h2>Your statements, organized</h2><p>Everything is processed locally on this device.</p></div></div><div class="drop-zone" id="drop-zone"><div class="upload-icon">${icon('upload')}</div><h2>Choose a bank statement</h2><p>CSV, Excel (.xlsx), or a PDF with selectable text · up to 20 MB</p><label class="btn">${icon('upload')} Browse files<input id="statement-file" type="file" accept=".csv,.tsv,.txt,.xlsx,.pdf" hidden style="display:none"></label><div class="file-types"><span class="tag">CSV</span><span class="tag purple">XLSX</span><span class="tag orange">PDF</span></div></div><div style="padding:0 23px 23px"><label class="field">PDF password, if protected<input id="pdf-password" type="password" autocomplete="off" placeholder="Optional · never saved"></label><p class="hint" style="margin-top:12px">Older .xls files: save as .xlsx first. Scanned PDFs need OCR or a CSV/Excel export from your bank.</p></div><div class="card-foot"><span>Progress is saved automatically in your encrypted vault.</span><button class="inline-link" data-action="statement-template">Try a sample CSV</button></div></section><aside class="card import-info"><span class="tag">YOU STAY IN CONTROL</span><h2 style="margin-top:18px">A few thoughtful checks.</h2><ol><li><strong>Choose the right columns.</strong><br>Match your bank’s date, description, debit and credit fields.</li><li><strong>Make it yours.</strong><br>Correct descriptions, assign subcategories and adjust amounts in the review table.</li><li><strong>Bring in only what you need.</strong><br>Exclude balances, summaries and duplicate rows before saving.</li></ol><div class="notice">Amounts use a decimal point. Commas are treated as thousands separators. Check your bank’s format during review.</div></aside></div>${D().imports.length?`<div class="section-title"><h2>Import history</h2></div><section class="card"><div class="table-wrap"><table><thead><tr><th>Statement</th><th>Imported</th><th>Transactions</th><th>Currency</th></tr></thead><tbody>${[...D().imports].reverse().map(i=>`<tr><td>${esc(i.name)}</td><td>${dateLabel(i.date)}</td><td>${i.count}</td><td>${esc(i.currency)}</td></tr>`).join('')}</tbody></table></div></section>`:''}`;
+  if(stage===1)return title+steps+`<div class="grid import-layout"><section class="card"><div class="card-head"><div><h2>Your statements, organized</h2><p>Everything is processed locally on this device.</p></div></div><div class="drop-zone" id="drop-zone"><div class="upload-icon">${icon('upload')}</div><h2>Choose a bank statement</h2><p>CSV/TSV up to 128 MB · Excel/PDF up to 20 MB · up to 500,000 rows</p><label class="btn">${icon('upload')} Browse files<input id="statement-file" type="file" accept=".csv,.tsv,.txt,.xlsx,.pdf" hidden style="display:none"></label><div class="file-types"><span class="tag">CSV</span><span class="tag purple">XLSX</span><span class="tag orange">PDF</span></div></div><div style="padding:0 23px 23px"><label class="field">PDF password, if protected<input id="pdf-password" type="password" autocomplete="off" placeholder="Optional · never saved"></label><p class="hint" style="margin-top:12px">Older .xls files: save as .xlsx first. Scanned PDFs need OCR or a CSV/Excel export from your bank.</p></div><div class="card-foot"><span>Progress is saved automatically in your encrypted vault.</span><button class="inline-link" data-action="statement-template">Try a sample CSV</button></div></section><aside class="card import-info"><span class="tag">YOU STAY IN CONTROL</span><h2 style="margin-top:18px">A few thoughtful checks.</h2><ol><li><strong>Choose the right columns.</strong><br>Match your bank’s date, description, debit and credit fields.</li><li><strong>Make it yours.</strong><br>Correct descriptions, assign subcategories and adjust amounts in the review table.</li><li><strong>Bring in only what you need.</strong><br>All rows start selected, including repeated transactions. Exclude any rows you do not need.</li></ol><div class="notice">Amounts use a decimal point. Commas are treated as thousands separators. Check your bank’s format during review.</div></aside></div>${D().imports.length?`<div class="section-title"><h2>Import history</h2></div><section class="card"><div class="table-wrap"><table><thead><tr><th>Statement</th><th>Imported</th><th>Transactions</th><th>Currency</th></tr></thead><tbody>${[...D().imports].reverse().map(i=>`<tr><td>${esc(i.name)}</td><td>${dateLabel(i.date)}</td><td>${i.count}</td><td>${esc(i.currency)}</td></tr>`).join('')}</tbody></table></div></section>`:''}`;
   if(stage===2) {
     const sheet=importState.sheets[importState.sheetIndex||0],headerIndex=importState.headerIndex||0,headers=sheet.rows[headerIndex]||[],mapping=autoMap(headers);
     return title+steps+`<section class="card pad"><div class="actions" style="justify-content:space-between"><div><h2>${esc(importState.name)}</h2><p class="hint">${sheet.rows.length} extracted rows. Select the row containing the column names.</p></div><span class="tag">${importState.kind.toUpperCase()}</span></div><div class="filters" style="margin-top:20px"><label>Worksheet <select id="import-sheet">${importState.sheets.map((s,i)=>option(i,s.name,importState.sheetIndex||0)).join('')}</select></label><label>Header row <input id="header-row" type="number" min="1" max="${sheet.rows.length}" value="${headerIndex+1}" style="width:80px"></label></div>${importState.kind==='pdf'?`<div class="notice warning">PDF layouts vary. The extracted text below is editable: use tabs between columns and one transaction per line. Verify empty debit/credit cells, wrapped descriptions and totals against the original.</div><label class="field">Extracted PDF text (tab-separated)<textarea id="pdf-raw" class="raw-text">${esc(importState.raw)}</textarea></label>${button('apply-pdf-text','Apply text corrections','check','secondary small','style="margin-top:10px"')}`:''}<div class="table-wrap" style="max-height:210px;margin-top:18px"><table><thead><tr>${headers.map((h,i)=>`<th>${i+1} · ${esc(h)}</th>`).join('')}</tr></thead><tbody>${sheet.rows.slice(headerIndex+1,headerIndex+5).map(row=>`<tr>${headers.map((_,i)=>`<td>${esc(row[i])}</td>`).join('')}</tr>`).join('')}</tbody></table></div><form id="map-form"><div class="grid mapping-grid">${Object.entries({date:'Date *',description:'Description *',debit:'Debit',final:'Final debit (optional)',credit:'Credit',amount:'Signed amount (alternative)',category:'Main category (optional hint)',subcategory:'Subcategory (optional)',account:'Account (optional)'}).map(([key,label])=>select(label,key,option(-1,'Not mapped',mapping[key])+headers.map((h,i)=>option(i,String(h)||'Column '+(i+1),mapping[key])).join(''))).join('')}${select('Statement date format','dateFormat',option('DMY','Day / month / year',D().settings.dateFormat)+option('MDY','Month / day / year',D().settings.dateFormat))}${select('Signed amount convention','signedMode',option('negative-debit','Negative = debit','negative-debit')+option('positive-debit','Positive = debit'))}${select('Default subcategory (optional)','defaultSubcategory',subcategoryOptions('','Assign each row during review'))}${select('Statement currency','currency',currencyOptions(currency()))}${field('Default account','accountName','text','','placeholder="e.g. HDFC Savings / UBS / Chase"')}</div><p class="hint">Map debit/credit columns or one signed amount. Subcategories determine the main category; a default applies only to rows without a subcategory. Map final debit when reimporting adjusted transactions. ISO dates (YYYY-MM-DD) are supported.</p><div class="form-error" role="alert"></div><div class="actions" style="margin-top:20px"><button class="btn" type="submit">Review transactions ${icon('arrow')}</button></div></form></section>`;
   }
-  const warnings=reviewWarnings();
-  return title+steps+`<section class="card"><div class="card-head"><div><h2>Review now or finish later.</h2><p id="review-count">${importReview.filter(t=>t.include).length} selected of ${importReview.length} rows · ${esc(importState.name)} · ${esc(importState.currency)}</p></div>${button('exclude-invalid','Exclude invalid rows','check','secondary small')}</div><div style="padding:0 23px"><div class="notice">Check every row against your statement. Category and subcategory are optional. Highlighted rows can be imported now and reviewed later; unresolved rows are excluded from totals. Adjust final debit to preserve the original amounts and record a correction.</div></div><div class="table-wrap" style="max-height:530px"><table class="review"><thead><tr><th>Use</th><th>Date</th><th>Description</th><th>Subcategory</th><th>Main category</th><th>Debit</th><th>Final debit</th><th>Credit</th><th>Review note</th></tr></thead><tbody>${importReview.map((t,i)=>`<tr class="${warnings[i]?'row-error':''} ${t.include?'':'row-excluded'}"><td><input type="checkbox" data-review="${i}" data-field="include" aria-label="Include row ${i+1}" ${t.include?'checked':''}></td><td><input type="date" value="${esc(t.date)}" data-review="${i}" data-field="date" aria-label="Date row ${i+1}"></td><td><input value="${esc(t.description)}" data-review="${i}" data-field="description" aria-label="Description row ${i+1}"></td><td><select data-review="${i}" data-field="subcategory" aria-label="Subcategory row ${i+1}">${subcategoryOptions(selectedSubcategory(t),t.subcategory?'Assign: '+t.subcategory:'Unassigned (optional)')}</select></td><td><select data-review="${i}" data-field="categoryId" aria-label="Main category row ${i+1}">${option('','Uncategorized',t.categoryId)+categoryOptions(t.categoryId)}</select></td>${['debit','final','credit'].map(k=>`<td><input type="number" step=".01" ${k==='final'?'':'min="0"'} value="${amountValue(k==='final'?C.finalDebit(t):t[k])}" data-review="${i}" data-field="${k}" aria-label="${k} row ${i+1}"></td>`).join('')}<td><span class="hint">${reviewNote(t,warnings[i])}</span></td></tr>`).join('')}</tbody></table></div><div style="padding:20px 23px"><label class="checkbox-label"><input id="accept-duplicates" type="checkbox" ${importState.acceptDuplicates?'checked':''}> Keep selected possible duplicates (I have checked them)</label><div class="actions" style="margin-top:18px">${button('finalize-import','Finalize selected transactions','check')}${button('back-mapping','Back to mapping','','secondary')}</div><p id="review-total" class="hint" style="margin-top:12px">Selected final debit: ${money(importReview.filter(t=>t.include).reduce((s,t)=>s+(Number.isFinite(C.finalDebit(t))?C.finalDebit(t):0),0),importState.currency,2)}</p></div></section>`;
+  reviewPage=Math.min(reviewPage,Math.max(0,Math.ceil(importReview.length/100)-1));
+  const warnings=reviewWarnings(),summary=reviewSummary();
+  return title+steps+`<section class="card"><div class="card-head"><div><h2>Review now or finish later.</h2><p id="review-count">${summary.count} selected of ${importReview.length} rows · ${esc(importState.name)} · ${esc(importState.currency)}</p></div><div class="actions">${button('select-all-import','Select all rows','','secondary small')}${button('deselect-all-import','Deselect all','','ghost small')}${button('exclude-invalid','Exclude invalid rows','check','secondary small')}</div></div><div style="padding:0 23px"><div class="notice">Check every row against your statement. Category and subcategory are optional. Highlighted rows can be imported now and reviewed later; unresolved rows are excluded from totals. Adjust final debit to preserve the original amounts and record a correction.</div></div><div class="table-wrap" style="max-height:530px"><table class="review"><thead><tr><th>Use</th><th>Date</th><th>Description</th><th>Subcategory</th><th>Main category</th><th>Debit</th><th>Final debit</th><th>Credit</th><th>Review note</th></tr></thead><tbody>${importReview.slice(reviewPage*100,(reviewPage+1)*100).map((t,j)=>{const i=reviewPage*100+j;return `<tr class="${warnings[i]?'row-error':''} ${t.include?'':'row-excluded'}"><td><input type="checkbox" data-review="${i}" data-field="include" aria-label="Include row ${i+1}" ${t.include?'checked':''}></td><td><input type="date" value="${esc(t.date)}" data-review="${i}" data-field="date" aria-label="Date row ${i+1}"></td><td><input value="${esc(t.description)}" data-review="${i}" data-field="description" aria-label="Description row ${i+1}"></td><td><select data-review="${i}" data-field="subcategory" aria-label="Subcategory row ${i+1}">${subcategoryOptions(selectedSubcategory(t),t.subcategory?'Assign: '+t.subcategory:'Unassigned (optional)')}</select></td><td><select data-review="${i}" data-field="categoryId" aria-label="Main category row ${i+1}">${option('','Uncategorized',t.categoryId)+categoryOptions(t.categoryId)}</select></td>${['debit','final','credit'].map(k=>`<td><input type="number" step=".01" ${k==='final'?'':'min="0"'} value="${amountValue(k==='final'?C.finalDebit(t):t[k])}" data-review="${i}" data-field="${k}" aria-label="${k} row ${i+1}"></td>`).join('')}<td><span class="hint">${reviewNote(t,warnings[i])}</span></td></tr>`;}).join('')}</tbody></table></div><div style="padding:20px 23px"><div class="actions">${button('review-prev','Previous','','ghost small',reviewPage===0?'disabled':'')}<span>Page ${reviewPage+1} of ${Math.max(1,Math.ceil(importReview.length/100))} · 100 rows per page</span>${button('review-next','Next','','ghost small',(reviewPage+1)*100>=importReview.length?'disabled':'')}</div><p class="hint">All rows, including repeated values, can be imported. Select all applies to every page.</p><div class="actions" style="margin-top:18px">${button('finalize-import','Finalize selected transactions','check')}${button('back-mapping','Back to mapping','','secondary')}</div><p id="review-total" class="hint" style="margin-top:12px">Selected final debit: ${money(summary.total,importState.currency,2)}</p></div></section>`;
 }
 function openModal(kind,title,body,{id='',submit='Save changes',remove=false,wide=false}={}) {
   modalState={kind,id};
@@ -195,7 +212,7 @@ async function loadStatement(file) {
   const result=await readFile(file,password);
   if(current!==session)return;
   const count=result.sheets.reduce((s,sh)=>s+sh.rows.length,0);
-  if(count>10000)throw new Error('Please split this file into fewer than 10,000 rows.');
+  if(result.sheets.some(sh=>sh.rows.length>MAX_STATEMENT_ROWS+1))throw new Error('A worksheet can contain up to 500,000 transaction rows plus a header. Split larger statements.');
   if(!count)throw new Error('No rows were found in the file.');
   importState={...result,name:file.name,sheetIndex:0,headerIndex:0};importReview=[];render();await saveWorkspace();
 }
@@ -223,7 +240,7 @@ function renderCategoryUpload(){
 async function startRestore() {
   if(demo)throw new Error('Leave the preview to restore a real ledger.');
   const file=await chooseFile('.pocketledger,.json');if(!file)return;
-  if(file.size>60*1024*1024)throw new Error('This backup exceeds 60 MB.');
+  if(file.size>512*1024*1024)throw new Error('This backup exceeds 512 MB.');
   const backup=JSON.parse(await file.text());
   openModal('restore-unlock','Open your encrypted backup',`<p class="modal-intro">${esc(file.name)} · Enter the PIN or password used when this backup was created. You will review the contents before replacing this ledger.</p>${backup.version===2?select('Unlock with','credentialMode',option('pin','PIN','pin')+option('recovery','Recovery password')):''}${field('Backup PIN / password','password','password','','required autocomplete="off"')}`,{submit:'Review backup'});modalState.backup=backup;
 }
@@ -319,19 +336,25 @@ function confirmDelete() {
   openModal('delete-confirm','Delete this entry?',`<p class="modal-intro">This removes the entry from your ledger. Existing backups are unaffected.</p>`,{submit:'Delete entry'});modalState.group=group;modalState.targetId=targetId;
 }
 async function finalizeImport() {
-  const selected=importReview.filter(t=>t.include),known=new Set(D().transactions.map(C.fingerprint));
+  if(importBusy)return;
+  importBusy=true;
+  const control=document.querySelector('[data-action=finalize-import]');if(control)control.disabled=true;
+  try{
+  const selected=importReview.filter(t=>t.include);
   if(!selected.length)throw new Error('Select at least one row to import.');
   for(const t of selected) {
     t.needsReview=!!C.transactionError(t,D());
-    const key=C.fingerprint(t);if(known.has(key)&&!document.querySelector('#accept-duplicates').checked)throw new Error('Possible duplicates are selected. Exclude them or confirm that you want to keep them.');known.add(key);
   }
   const batchId=C.uid();
-  await mutate(d=>{d.transactions.push(...selected.map(({include,...t})=>({...t,importId:batchId})));d.imports.push({id:batchId,name:importState.name,date:C.today(),count:selected.length,currency:importState.currency});d.workspace={...d.workspace,importState:null,importReview:[],view:'transactions'};},`${selected.length} transactions imported`);
+  toast('Saving selected transactions to your encrypted vault…');
+  await mutate(d=>{for(const {include,...t} of selected)d.transactions.push({...t,importId:batchId});d.imports.push({id:batchId,name:importState.name,date:C.today(),count:selected.length,currency:importState.currency});d.workspace={...d.workspace,importState:null,importReview:[],view:'transactions'};},`${selected.length} transactions imported`);
   importState=null;importReview=[];view='transactions';render();
+  }finally{importBusy=false;if(control?.isConnected)control.disabled=false;}
 }
 function budgetCSV(){const p=budgetYear+(budgetMode==='month'?'-'+budgetMonth:''),prev=compareYear+(budgetMode==='month'?'-'+budgetMonth:'');return C.toCSV([['Category','Currency','Period','Planned','Actual','Remaining','Comparison period','Previous planned','Previous actual'],...D().categories.filter(c=>C.categoryRole(D(),c.id)==='expense').map(c=>[c.name,currency(),p,C.planned(D(),c.id,p)/100,C.actual(D(),c.id,p)/100,(C.planned(D(),c.id,p)-C.actual(D(),c.id,p))/100,prev,C.planned(D(),c.id,prev)/100,C.actual(D(),c.id,prev)/100])]);}
 function timelineCSV(){return C.toCSV([['Milestone','Date','Month','Year','Currency',...selectedFamily().map(f=>f.name+' age'),'Target today','Future target','Saved today','Monthly contribution','Annual return %','Annual inflation %','Projected savings','Shortfall','Notes'],...D().milestones.filter(m=>(m.currency||'INR')===currency()).map(m=>{const p=C.projection(m);return[m.name,m.date,m.date.slice(0,7),m.date.slice(0,4),m.currency||'INR',...selectedFamily().map(f=>C.ageOn(f.birthDate,m.date)),m.target/100,p.required/100,m.saved/100,m.monthly/100,m.rate,m.inflation,p.projected/100,p.gap/100,m.notes];})]);}
-async function onAction(action,id) {
+async function onAction(action,id,element) {
+  if(await Planning.handlePlanningAction(action,element||{dataset:{id}},planningContext()))return;
   const editors={'add-transaction':transactionModal,'edit-transaction':transactionModal,'add-category':categoryModal,'edit-category':categoryModal,'add-type':typeModal,'edit-type':typeModal,'add-report':reportModal,'edit-report':reportModal,'add-budget':budgetModal,'edit-budget':budgetModal,'add-family':familyModal,'edit-family':familyModal,'add-milestone':milestoneModal,'edit-milestone':milestoneModal};
   if(editors[action]){editors[action](id||'');return;}
   if(action==='enter-demo'){demo=true;session={data:demoData()};view='dashboard';render();}
@@ -343,7 +366,10 @@ async function onAction(action,id) {
   else if(action==='delete-item')confirmDelete();
   else if(action==='tx-prev'){txPage=Math.max(0,txPage-1);render();}
   else if(action==='tx-next'){txPage++;render();}
-  else if(action==='reset-import'){importState=null;importReview=[];render();}
+  else if(action==='review-prev'){reviewPage=Math.max(0,reviewPage-1);render();}
+  else if(action==='review-next'){reviewPage++;render();}
+  else if(action==='select-all-import'||action==='deselect-all-import'){for(const row of importReview)row.include=action==='select-all-import';render();}
+  else if(action==='reset-import'){reviewPage=0;importState=null;importReview=[];render();}
   else if(action==='back-mapping'){importReview=[];render();}
   else if(action==='apply-pdf-text'){const raw=document.querySelector('#pdf-raw').value;importState.raw=raw;importState.sheets[0].rows=C.parseCSV(raw,'\t');importState.headerIndex=0;render();}
   else if(action==='exclude-invalid'){importReview.forEach(t=>{if(C.transactionError(t,D()))t.include=false;});render();}
@@ -359,15 +385,15 @@ async function onAction(action,id) {
   else if(action==='budget-year'){budgetMode='year';render();}
   else if(action==='copy-report'){await mutate(d=>{const r=d.reports.find(r=>r.id===id);d.reports.push({...structuredClone(r),id:C.uid(),name:r.name+' (copy)'});});render();}
   else if(action==='export-report'){const r=D().reports.find(r=>r.id===id),p=C.pivot(D(),r),unit=r.measure==='count'?1:100;await download('report-'+r.type+'.csv',C.toCSV([[r.dimension,...p.columns,'Grand total','Currency'],...p.rows.map(row=>[row,...p.columns.map(c=>p.get(row,c)/unit),p.columns.reduce((s,c)=>s+p.get(row,c),0)/unit,r.currency||'INR']),['Grand total',...p.columns.map(c=>p.rows.reduce((s,row)=>s+p.get(row,c),0)/unit),C.reportRows(D(),r).reduce((s,t)=>s+C.measure(t,r.measure),0)/unit,r.currency||'INR']]));}
-  else if(action==='backup'){await saveQueue;await download('pocket-ledger-'+C.today()+'.pocketledger',JSON.stringify(envelope),'application/json');}
+  else if(action==='backup'){await saveWorkspace();await mutate(()=>{},'');await saveQueue;await download('pocket-ledger-'+C.today()+'.pocketledger',JSON.stringify(envelope),'application/json');}
   else if(action==='restore'||action==='restore-locked')await startRestore();
   else if(action==='change-password')passwordModal();
   else if(action==='change-pin')pinModal();
   else if(action==='toggle-recovery'){authRecovery=!authRecovery;renderAuth();}
 }
 document.addEventListener('click',async e=>{
-  lastActivity=Date.now();const target=e.target.closest('[data-action],[data-view]');if(!target)return;
-  try{if(target.dataset.view){if(!session)return;view=target.dataset.view;render();}else await onAction(target.dataset.action,target.dataset.id);await saveWorkspace();}catch(error){const errorBox=modal.open?modal.querySelector('.form-error'):null;if(errorBox)errorBox.textContent=error.message;else toast(error.message);}
+  lastActivity=Date.now();workspaceRevision++;const target=e.target.closest('[data-action],[data-view]');if(!target)return;
+  try{if(target.dataset.view){if(!session)return;view=target.dataset.view;render();}else await onAction(target.dataset.action,target.dataset.id,target);await saveWorkspace();}catch(error){const errorBox=modal.open?modal.querySelector('.form-error'):null;if(errorBox)errorBox.textContent=error.message;else toast(error.message);}
 });
 document.addEventListener('submit',async e=>{
   e.preventDefault();const form=e.target,submit=form.querySelector('[type=submit]');if(submit?.disabled)return;if(submit)submit.disabled=true;
@@ -375,11 +401,11 @@ document.addEventListener('submit',async e=>{
     if(form.id==='auth-form') {
       if(Date.now()<authRetryAt)throw new Error('Please wait a moment before trying again.');
       authBusy=true;lockRequested=false;const f=new FormData(form),password=String(f.get('password'));
-      if(envelope){session=await Vault.unlock(envelope,password,authRecovery?'recovery':'pin');}
+      if(envelope){const opened=await Vault.unlock(envelope,password,authRecovery?'recovery':'pin');const progress=await Vault.readWorkspace(opened,envelope);if(progress)opened.data.workspace=progress;session=opened;}
       else {if(password!==f.get('confirm'))throw new Error('The PINs do not match.');if(f.get('recovery')!==f.get('recoveryConfirm'))throw new Error('The recovery passwords do not match.');const created=await Vault.createPinVault(C.newData(),password,String(f.get('recovery')));await Vault.writeEnvelope(created.envelope);envelope=created.envelope;session=created;}
       authFailures=0;demo=false;lastActivity=Date.now();view='dashboard';lastWorkspace='';
       restoreWorkspace();if(document.hidden||lockRequested)await lock();else if(authRecovery){pinModal(true);modal.querySelector('[name=current]').value=password;}
-    } else if(form.id==='modal-form'){form.dataset.submitting='true';await submitModal(form);}
+    } else if(form.id==='modal-form'){form.dataset.submitting='true';if(!await Planning.handlePlanningSubmit(form,planningContext()))await submitModal(form);}
     else if(form.id==='preferences-form'){const f=new FormData(form);await mutate(d=>{d.settings={...d.settings,currency:String(f.get('currency')),dateFormat:String(f.get('dateFormat')),autoLock:+f.get('autoLock'),appearance:String(f.get('appearance'))};});render();}
     else if(form.id==='map-form') {
       const f=new FormData(form),mapping={};for(const key of ['date','description','debit','final','credit','amount','category','subcategory','account'])mapping[key]=+f.get(key);
@@ -391,7 +417,8 @@ document.addEventListener('submit',async e=>{
       importState.mappingValues=formValues(form);importState.currency=String(f.get('currency'));
       importReview=mapTransactions(sheet.rows.slice((importState.headerIndex||0)+1),mapping,{dateFormat:String(f.get('dateFormat')),account:String(f.get('accountName')),defaultSubcategory:String(f.get('defaultSubcategory')),categories:D().categories,signedMode:String(f.get('signedMode')),date1904:sheet.date1904}).map(t=>({...t,currency:importState.currency}));
       if(!importReview.length)throw new Error('There are no transaction rows after the selected header.');
-      const seen=new Set(D().transactions.map(C.fingerprint));for(const t of importReview){const key=C.fingerprint(t);if(seen.has(key))t.include=false;seen.add(key);}
+      if(importReview.length>MAX_STATEMENT_ROWS)throw new Error('Import up to 500,000 transaction rows at a time.');
+      reviewPage=0;
       render();
     }
   } catch(error){if(form.id==='auth-form'){authFailures++;if(authFailures>=5)authRetryAt=Date.now()+Math.min(60000,1000*2**Math.min(authFailures-5,6));}const box=form.querySelector('.form-error');if(box)box.textContent=error.message;else toast(error.message);}
@@ -399,14 +426,14 @@ document.addEventListener('submit',async e=>{
 });
 document.addEventListener('change',async e=>{
   if(rendering||locking||!session)return;
-  lastActivity=Date.now();const t=e.target;
+  lastActivity=Date.now();workspaceRevision++;const t=e.target;
   try {
+    if(await Planning.handlePlanningChange(t,planningContext()))return;
     if(t.id==='statement-file'){await loadStatement(t.files[0]);return;}
     if(t.dataset.review!==undefined){updateReview(t);refreshReview();return;}
-    if(t.dataset.tx){await mutate(d=>{const row=d.transactions.find(x=>x.id===t.dataset.tx);if(t.dataset.classification==='category'){row.categoryId=t.value;if(!d.categories.find(c=>c.id===t.value)?.subs.includes(row.subcategory))row.subcategory='';}else Object.assign(row,C.resolveClassification(d.categories,t.value)||{categoryId:row.categoryId,subcategory:''});row.needsReview=!!C.transactionError(row,d);});render();return;}
+    if(t.dataset.tx){await mutate(d=>{const index=d.transactions.findIndex(x=>x.id===t.dataset.tx);const row=d.transactions[index]={...d.transactions[index]};if(t.dataset.classification==='category'){row.categoryId=t.value;if(!d.categories.find(c=>c.id===t.value)?.subs.includes(row.subcategory))row.subcategory='';}else Object.assign(row,C.resolveClassification(d.categories,t.value)||{categoryId:row.categoryId,subcategory:''});row.needsReview=!!C.transactionError(row,d);});render();return;}
     if(t.dataset.familySelect){const ids=selectedFamily().map(f=>f.id);await mutate(d=>{d.settings.timelineMembers=t.checked?[...new Set([...ids,t.dataset.familySelect])]:ids.filter(id=>id!==t.dataset.familySelect);});render();return;}
     if(t.id==='category-sheet'){categoryWorkbook.sheetIndex=+t.value;renderCategoryUpload();return;}
-    if(t.id==='accept-duplicates')importState.acceptDuplicates=t.checked;
     if(t.id==='currency-select'){await mutate(d=>d.settings.currency=t.value,'');txPage=0;render();}
     else if(t.id==='overview-period'&&t.value){period=t.value;render();}
     else if(t.id==='tx-category'){txCategory=t.value;txPage=0;render();}
@@ -422,15 +449,18 @@ document.addEventListener('change',async e=>{
   }catch(error){toast(error.message);}finally{await saveWorkspace().catch(e=>toast('Could not save progress: '+e.message));}
 });
 function reviewWarnings(){
-  const seen=new Set(D().transactions.map(C.fingerprint));
-  return importReview.map(t=>{const key=C.fingerprint(t),duplicate=seen.has(key);if(t.include)seen.add(key);return C.transactionError(t,D())||(duplicate?'Possible duplicate — exclude or verify':'');});
+  const warnings=[];
+  for(let i=reviewPage*100;i<Math.min(importReview.length,(reviewPage+1)*100);i++)warnings[i]=C.transactionError(importReview[i],D());
+  return warnings;
 }
+function reviewSummary(){let count=0,total=0;for(const row of importReview)if(row.include){count++;if(!C.transactionError(row,D())&&C.amountsResolved(row))total+=C.finalDebit(row);}return {count,total};}
 function reviewNote(row,warning){return esc(warning||'Ready')+(warning&&row.rawValues?`<details><summary>Original values</summary><pre class="raw-values">${esc(JSON.stringify(row.rawValues,null,2))}</pre></details>`:'');}
 function refreshReview(){
   const warnings=reviewWarnings();
   // Update computed cells and warnings without removing the next field or button being tapped.
-  document.querySelectorAll('.review tbody tr').forEach((tr,i)=>{
-    const row=importReview[i];
+  document.querySelectorAll('.review tbody tr').forEach(tr=>{
+    const i=+tr.querySelector('[data-review]').dataset.review,row=importReview[i];
+    tr.querySelector('[data-field=include]').checked=row.include;
     tr.classList.toggle('row-error',!!warnings[i]);tr.classList.toggle('row-excluded',!row.include);
     for(const name of ['debit','final','credit']){
       const input=tr.querySelector('[data-field="'+name+'"]');
@@ -440,8 +470,9 @@ function refreshReview(){
     const sub=tr.querySelector('[data-field=subcategory]');sub.value=selectedSubcategory(row);sub.options[0].textContent=row.subcategory?'Assign: '+row.subcategory:'Unassigned (optional)';
     const note=tr.querySelector('td:last-child .hint'),html=reviewNote(row,warnings[i]);if(note.innerHTML!==html)note.innerHTML=html;
   });
-  document.querySelector('#review-count').textContent=importReview.filter(t=>t.include).length+' selected of '+importReview.length+' rows · '+importState.name+' · '+importState.currency;
-  document.querySelector('#review-total').textContent='Selected final debit: '+money(importReview.filter(t=>t.include).reduce((sum,t)=>sum+(Number.isFinite(C.finalDebit(t))?C.finalDebit(t):0),0),importState.currency,2);
+  const summary=reviewSummary();
+  document.querySelector('#review-count').textContent=summary.count+' selected of '+importReview.length+' rows · '+importState.name+' · '+importState.currency;
+  document.querySelector('#review-total').textContent='Selected final debit: '+money(summary.total,importState.currency,2);
 }
 function updateReview(input){
   const row=importReview[+input.dataset.review],field=input.dataset.field;if(!row)return;
@@ -455,7 +486,7 @@ function updateReview(input){
 }
 document.addEventListener('input',e=>{
   if(rendering||locking||!session)return;
-  lastActivity=Date.now();const t=e.target;
+  lastActivity=Date.now();workspaceRevision++;const t=e.target;
   if(t.dataset.review!==undefined)updateReview(t);
   if(t.closest('#map-form')&&importState)importState.mappingValues=formValues(t.closest('form'));
   if(t.id==='pdf-raw'&&importState)importState.raw=t.value;
@@ -465,7 +496,7 @@ document.addEventListener('input',e=>{
     if(t.name==='final')modalState.adjustment=amount('final')-debit+credit;else if(t.name!=='currency')final.value=amountValue(debit-credit+(modalState.adjustment??0));
     modal.querySelector('#adjustment-hint').textContent='Adjustment: '+money(modalState.adjustment||0,modal.querySelector('[name=currency]').value,2)+' · Final debit = debit − credit + adjustment';
   }
-  if(!['password','file'].includes(t.type))saveWorkspace().catch(e=>toast('Could not save progress: '+e.message));
+  if(!['password','file'].includes(t.type)){clearTimeout(workspaceTimer);workspaceTimer=setTimeout(()=>saveWorkspace().catch(e=>toast('Could not save progress: '+e.message)),300);}
 });
 modal.addEventListener('cancel',e=>{e.preventDefault();onAction('close-modal').then(saveWorkspace).catch(e=>toast(e.message));});
 document.addEventListener('dragover',e=>{if(e.target.closest('#drop-zone'))e.preventDefault();});

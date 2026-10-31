@@ -2,7 +2,7 @@ import { build } from 'esbuild';
 import fs from 'node:fs/promises';
 await fs.mkdir('dist/vendor', {recursive:true});
 await build({entryPoints:['src/app.js'],bundle:true,format:'esm',target:'chrome110',outfile:'dist/app.js',minify:true,legalComments:'linked'});
-await fs.copyFile('src/styles.css','dist/styles.css');
+await fs.writeFile('dist/styles.css',(await fs.readFile('src/styles.css','utf8'))+'\n'+(await fs.readFile('src/planning.css','utf8')));
 await fs.copyFile('src/index.html','dist/index.html');
 await fs.cp('node_modules/clawpdf/dist','dist/vendor/pdf',{recursive:true});
 await fs.mkdir('dist/licenses',{recursive:true});

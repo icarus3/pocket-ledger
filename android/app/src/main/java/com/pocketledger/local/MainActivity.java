@@ -114,7 +114,10 @@ public final class MainActivity extends Activity {
         }
         @JavascriptInterface public boolean isFilePickerOpen() { return pickerOpen; }
         @JavascriptInterface public void saveFile(String filename, String mime, String content) {
-            if (content == null || content.length() > 60 * 1024 * 1024) return;
+            if (content == null || content.length() > 512 * 1024 * 1024) {
+                runOnUiThread(() -> Toast.makeText(MainActivity.this, "This export exceeds 512 MB. Export a smaller date range.", Toast.LENGTH_LONG).show());
+                return;
+            }
             runOnUiThread(() -> {
                 if (pickerOpen || pendingExport != null) return;
                 pendingExport = content;
@@ -148,7 +151,13 @@ public final class MainActivity extends Activity {
             if (!expired && result == RESULT_OK && data != null && data.getData() != null && text != null) {
                 try (OutputStream output = getContentResolver().openOutputStream(data.getData(), "wt")) {
                     if (output == null) throw new java.io.IOException("No output stream");
-                    output.write(text.getBytes(StandardCharsets.UTF_8));
+                    // Write bounded chunks instead of allocating a second byte
+                    // array for a large encrypted backup or statement export.
+                    java.io.Writer writer = new java.io.OutputStreamWriter(output, StandardCharsets.UTF_8);
+                    for (int offset = 0; offset < text.length(); offset += 32768) {
+                        writer.write(text, offset, Math.min(32768, text.length() - offset));
+                    }
+                    writer.flush();
                     Toast.makeText(this, "File saved.", Toast.LENGTH_SHORT).show();
                 } catch (Exception error) {
                     Toast.makeText(this, "Could not save the file. Try another location.", Toast.LENGTH_LONG).show();

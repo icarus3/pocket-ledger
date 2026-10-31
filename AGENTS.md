@@ -6,11 +6,13 @@ This file is the handoff for humans and coding agents. Read it before changing t
 
 - Repository: `https://github.com/icarus3/pocket-ledger.git`; working branch: `main`.
 - Prepared workspace: `C:\Ashish\android`. Scripts resolve the repository from their own location, so another checkout path is supported.
-- Verified on **2026-10-19**: version **1.1.1**, Android `versionCode 3`, application ID and namespace **`com.pocketledger.local`**.
+- Verified on **2026-10-31**: version **1.2.0**, Android `versionCode 4`, application ID and namespace **`com.pocketledger.local`**.
 - Original release: 1.0.0 / code 1. The nine import, session, security and UI fixes shipped as 1.1.0 / code 2 (`9e5ebaf`). Amount replacement on focus and preserving import-row clicks shipped as 1.1.1 / code 3 (`ca04864`). These fixes are saved in Git; do not restart from the earlier report that none were saved.
-- Current local signed APK: `releases/Pocket-Ledger-release.apk`; versioned copy: `releases/Pocket-Ledger-1.1.1.apk`. APKs, tool installations, caches and signing files are intentionally not tracked. A fresh clone will not contain them.
-- Last full validation: 15 core tests, 26 browser workflow checks, 24 HTML screens with 24 PNG screenshots, responsive checks at 390/800/1280 CSS pixels, Android release compilation and lint. Lint reported two warnings (`GradleDependency`, `SetJavaScriptEnabled`), no errors.
+- Current local signed APK: `releases/Pocket-Ledger-release.apk`; versioned copy: `releases/Pocket-Ledger-1.2.0.apk`. APKs, tool installations, caches and signing files are intentionally not tracked. A fresh clone will not contain them.
+- Last full validation: 22 core/model tests, 36 browser workflows (26 existing plus 10 new), three scalability tests, one isolated encrypted-storage test, 500,000-row engine/import/save/reopen checks, 35 HTML screens with 35 PNG screenshots, responsive checks at 390/800/1280 CSS pixels, Android release compilation and lint. Lint reported one `SetJavaScriptEnabled` warning and no errors. APK package/version/certificate and bundled web assets were verified.
 - No physical Android device was connected. Installation over an existing release, native file pickers and actual Android process death still need device verification. Browser lifecycle tests do not establish these device results.
+
+Version **1.2.0 / versionCode 4** adds Valuation, Investment plan and Home loan plus 500,000-row statement handling and all-selected import review. The full desktop-browser stress flow verified 501,210 cumulative transactions after import and authenticated reopening. Physical-device capacity at 500,000 records is unverified.
 
 Update this baseline when making a release. The source configuration is authoritative if version numbers change.
 
@@ -34,6 +36,7 @@ A previous runner failed before shell startup with **`setup refresh had errors`*
 | --- | --- |
 | `src/app.js` | Screens, event handlers, mutations, queued encrypted saves, import/edit drafts, auth/PIN flows, appearance and lifecycle handling. |
 | `src/core.js` | Data validation, integer amounts, classification, CSV, aggregation, budgets, reports and timeline calculations. |
+| `src/planning-model.js`, `src/planning.js`, `src/planning.css` | Backward-compatible planning data/validation, valuation pivots, investment month/year calculations, home-loan summaries, option management and section forms. |
 | `src/imports.js` | CSV/TSV, XLSX ZIP/XML and local PDF parsing. |
 | `src/vault.js` | IndexedDB, Web Crypto, legacy password vaults, PIN/recovery key wrapping. |
 | `src/ui.js`, `src/styles.css`, `src/index.html` | Shared UI/charts, responsive themes and document shell. |
@@ -46,13 +49,15 @@ A previous runner failed before shell startup with **`setup refresh had errors`*
 | `scripts/prepare-android.ps1` | Download verification, extraction, SDK installation and dependency-cache preparation. |
 | `scripts/build-apk.ps1` | Native build/lint, existing-key checks and copy to `releases/`. |
 | `tests/core.test.mjs` | Pure calculation, validation and import rules. |
+| `tests/planning.test.mjs`, `tests/planning-ui.mjs` | Planning math/validation, section workflows, option lists, duplicate selection, saved drafts and optional 500,000-row browser stress. |
+| `tests/scalability.test.mjs`, `tests/workspace.test.mjs` | 500,000-row import/calculation/encryption checks and isolated encrypted-workspace compatibility/tamper checks. |
 | `tests/ui.mjs`, `tests/update-ui.mjs`, `tests/fixtures.mjs` | Browser workflows and generated fixtures. |
 | `scripts/previews.mjs` | Interactive fictional demo, screen HTML, PNGs and responsive checks. |
 | `scripts/package.py` | Source/preview ZIPs, APK copy and SHA-256 manifest; excludes signing credentials. |
 
 This is plain JavaScript bundled with esbuild, inside a native Java Android WebView. There is no hosted backend, account, cloud sync or runtime dependency download. Native content loads from `https://appassets.androidplatform.net/assets/www/index.html` using AndroidX WebViewAssetLoader. Keep that origin stable because WebView storage belongs to the origin. JavaScript targets Chromium 110; use a compatible Android System WebView/Chrome.
 
-`npm run build` writes `dist/` and copies it into **tracked** `android/app/src/main/assets/www/`. It bundles JavaScript, copies CSS/HTML, samples, clawpdf/PDFium WASM and third-party licenses. Edit `src/`, then rebuild; do not hand-edit the minified Android bundle. `dist/` is ignored. The native assets and `previews/` are tracked so a checkout can build an APK without Node.js and open visual previews.
+`npm run build` writes `dist/` and copies it into **tracked** `android/app/src/main/assets/www/`. It bundles JavaScript, combines `styles.css` and `planning.css`, and copies HTML, samples, clawpdf/PDFium WASM and third-party licenses. Edit `src/`, then rebuild; do not hand-edit the minified Android bundle. `dist/` is ignored. The native assets and `previews/` are tracked so a checkout can build an APK without Node.js and open visual previews.
 
 ## Behavior that must be preserved
 
@@ -66,7 +71,9 @@ This is plain JavaScript bundled with esbuild, inside a native Java Android WebV
 - Unknown or ambiguous imported classification remains available for review. Only a unique subcategory match, or a match with a valid parent hint, may infer the parent. Defaults must not override supplied unresolved subcategories.
 - Both transaction and category XLSX uploads support worksheet selection. Keep namespace-aware XML handling, normalized relationship paths, shared and inline strings, and the Excel 1904 date system. Cell errors and formulas without cached values must remain reviewable.
 - Supported formats are CSV/TSV, `.xlsx` and selectable-text PDF, including password-protected PDF. Legacy `.xls` must be resaved as `.xlsx`; image-only PDFs require external OCR. PDF parsing is local through clawpdf/PDFium.
-- Limits: 20 MB per input, 10,000 statement rows, 60 MB expanded XLSX contents, 150 PDF pages; category imports accept 1–1,000 rows. Preserve these limits when changing parsing.
+- Limits: 128 MB per CSV/TSV input; 20 MB per XLSX or PDF; up to 500,000 transaction rows plus a header per statement worksheet; 60 MB expanded XLSX contents; 150 PDF pages; category imports accept 1–1,000 rows. Encrypted backup restores accept up to 512 MB. These limits replace the old 10,000-row/20-MB-everywhere policy; retain the format-specific limits when changing parsing.
+- Import review starts with every row selected. Do not automatically detect, exclude or block duplicate-looking rows. Select all and Deselect all apply across every page, including repeated rows. Render 100 review rows per page and preserve edits using absolute source indexes. Finalization includes every selected row, including unresolved rows flagged for later review.
+- Large ledgers must avoid rendering entire statements, spreading hundreds of thousands of function arguments, or allocating a string per base64 byte. Preserve the separate encrypted workspace-save path so changing a filter or draft does not repeatedly clone and reseal a 500,000-record ledger. Desktop/browser stress checks do not establish memory/storage capacity on a physical tablet.
 - Decimal points are decimal separators; commas are grouping separators. ISO dates and Excel serial dates work; the INR default date convention is day/month/year. Do not infer a bank balance from statement headings or totals.
 
 ### Amount-field interaction
@@ -79,6 +86,8 @@ Import review uses `refreshReview()` to update totals, warnings and counts in pl
 
 - Brief app switches retain the unlocked session. Backgrounding requests an encrypted progress save. The default inactivity timeout is five minutes; supported choices are 1, 2, 5, 10 and 15 minutes. Explicit lock and expiry save first, then clear active plaintext/key references and form contents.
 - `data.workspace` holds the saved screen/filter state, import worksheet/header/mapping/review/exclusions and unfinished form fields. Capture changes while typing as well as at lifecycle boundaries; the OS may kill a background process before a last-minute asynchronous save finishes.
+- Large-ledger/draft progress can be stored separately under key `workspace` in the same IndexedDB `vault` store, encrypted with the active nonextractable data key, a fresh 12-byte IV and authenticated label `PocketLedger:workspace:v1`. Its `baseIv` binds it to the current primary envelope. Apply it only when the primary IV matches; a full envelope save removes it atomically. Keep the original `primary` envelope and backup format compatible. Backup creation consolidates current workspace progress into the encrypted payload before export. Never treat a damaged matching workspace record as an empty draft.
+- Chromium imposes a serialized-size limit on each IndexedDB value. Large `primary` and `workspace` ciphertexts use transparent chunks of at most 4,194,304 base64 characters (4 MiB ASCII text), with `_ciphertextChunks` metadata and keys `<record>:ciphertext:<index>`. Commit each record's metadata/chunks and removal of its prior chunks atomically; reject missing or invalid chunks. `readEnvelope()` reassembles the original envelope and strips internal chunk metadata before callers decrypt or export it. Read existing unchunked records directly. This is a local storage layout detail, not a v1/v2 encryption-envelope migration; backup envelopes retain their original format.
 - Reopening after process termination requires authentication, then restores saved progress. Do not drop an in-memory import when locking. Preserve pending forms across the PIN-recovery flow (`suspendedDraft` handling).
 - Password and file inputs are not persisted as form drafts. No ledger, import contents or edit draft belongs in plaintext localStorage or logs.
 - New ledgers use a user-chosen four-digit PIN plus a recovery password of at least ten characters. Existing password vaults remain readable. Migrate only after successful authentication; the original password becomes the recovery password when setting up a PIN.
@@ -89,6 +98,11 @@ Import review uses `refreshReview()` to update totals, warnings and counts in pl
 Encryption details for compatibility work: IndexedDB database `pocket-ledger-secure`, store `vault`, key `primary`. Payload encryption is AES-256-GCM with a random 12-byte IV and authenticated-data string `PocketLedger:v1`. Legacy envelope version 1 uses PBKDF2-HMAC-SHA256 with a 16-byte salt, normally 600,000 iterations; supported stored iteration counts are validated between 100,000 and 2,000,000. Version 2 uses a random data key independently wrapped by the PIN and recovery password, each with a fresh salt, PBKDF2 at 600,000 iterations and authenticated key-slot labels. Imported active keys are nonextractable; transient raw key bytes are cleared. Envelope version and payload schema version are distinct concepts. Change formats only with explicit migration and compatibility tests.
 
 ### Other UI and calculation rules
+
+- `data.planning` is optional for older ledgers/backups; validate it when present without inventing or overwriting an existing vault on errors. Default option lists are created when a new ledger or first planning mutation needs them.
+- Valuation uses account type, parent-qualified subtype, month, year and category dropdowns, plus value and currency. Manage those option lists within Valuation. Pivots group by account type, subtype, category, month or year and sum values or count rows in one currency. Values are snapshots; summing months sums snapshots rather than calculating investment returns. Preserve parent-qualified subtype labels and dependent subtype choices when restoring drafts.
+- Investment plan manages investment types in the same section. Plans store details, account reference, start/end dates, monthly amount and currency. One contribution is scheduled per active calendar month, including both start and end months; yearly totals count only active months in that year. Actual invested amounts are separate monthly totals; replacing one month must not duplicate it. An empty end date means ongoing. Do not change currency while actual amounts exist.
+- Home loan has cost components (type, reference percentage, to-pay and paid), a numbered repayment schedule (payment type, agreement value, reference percentage, to-pay, demand amount, paid and comment), and dated status snapshots (approved, disbursed, cumulative principal and interest paid). Summarize costs by component; keep cost and repayment totals separate. Loan summaries use the latest dated snapshot in the selected currency, never the sum of cumulative snapshots. Outstanding principal is disbursed minus principal paid. Percentages do not silently recalculate entered agreement/demand amounts.
 
 - Money Timeline has explicit family add/edit/delete controls and member selection. `settings.timelineMembers` persists selected IDs. Each selected member gets a separate age column in the timeline and CSV.
 - Timeline calculations use whole months, an effective annual-to-monthly return conversion and month-end contributions. Inflation affects the target. Milestones are independent plans, with no automatic allocation of the same savings between goals.
@@ -202,6 +216,8 @@ Leave the last command running in that terminal. In a second PowerShell terminal
 
 ```powershell
 npm.cmd run test:ui
+node --test tests/workspace.test.mjs
+npm.cmd run test:scale
 node scripts/previews.mjs
 ```
 
@@ -215,7 +231,9 @@ Use `http://127.0.0.1:4173/?demo=1` for fictional data or the same URL without t
 
 The server serves **`dist/`**, with no automatic source rebuild. After changing source, rerun `npm.cmd run build` before browser checks, previews or an APK using bundled assets. If port 4173 is occupied, first check whether the existing server belongs to this checkout and serves the current bundle. Stop only a process you own; do not blindly terminate unrelated processes.
 
-Check meaningful behavior affected by a change. For releases, run the core and both browser suites, regenerate previews, inspect representative screenshots, and run native compilation/lint. The current browser suite covers the original 16 workflows and 10 update scenarios: optional classification/parent assignment, currency/order preservation, unresolved raw amounts and later correction, multi-worksheet namespaced Excel, encrypted drafts/reopen/lock, legacy migration, PIN change/recovery with a draft, amount replacement via mouse/touch/keyboard, family selection, themes, PDF, reports, budgets, exports and restore. Do not replace these checks with tests that merely repeat implementation details.
+Check meaningful behavior affected by a change. For releases, run the core/model tests, existing browser suites and planning suite, regenerate previews, inspect representative screenshots, and run native compilation/lint. The 22 core/model tests and existing 26 browser checks cover the original workflows plus planning math/validation. Planning browser checks add option management, valuation pivots/currency separation, investment active-month/year totals and actuals, home-loan cumulative snapshots, encrypted drafts/reopen and bulk selection of duplicate rows. Run `node --test tests/workspace.test.mjs` for isolated encrypted-draft integrity and `npm.cmd run test:scale` for the 500,000-row calculation/import/encryption workload. With the preview server running, set `$env:PL_STRESS = '1'` and run `node tests/planning-ui.mjs` for the full 500,000-row browser import/save/reopen workload. Record observed timings and limits after success; do not claim physical-device capacity from desktop tests. Do not replace these checks with tests that merely repeat implementation details.
+
+During 1.2.0 validation, an isolated Chrome engine/IndexedDB run saved and PIN-reopened 500,000 fictional records in approximately 7.4 seconds after implementing chunked ciphertext storage. The full browser workflow uploaded a fictional 15,888,925-byte CSV containing 500,000 rows: review 6,724 ms; encrypted draft save/lock/reopen 11,037 ms; final import 5,523 ms; authenticated ledger reopen 1,976 ms. It verified 501,210 cumulative transactions. These desktop measurements do not establish physical-tablet capacity.
 
 ## Build an APK
 
@@ -257,7 +275,7 @@ The release script deliberately refuses to generate a replacement key. Without t
 
 For every new distributed app update:
 
-1. Increase `versionCode` in `android/app/build.gradle`. Keep its `versionName` and `package.json` version consistent. The current baseline is 1.1.1 / code 3; documentation-only commits do not require an app version bump.
+1. Increase `versionCode` in `android/app/build.gradle`. Keep its `versionName` and `package.json` version consistent. The current verified baseline is 1.2.0 / code 4. Documentation-only commits do not require an app version bump.
 2. Preserve application ID **`com.pocketledger.local`**, native content origin and the existing private signing key.
 3. Build/test/refresh assets and previews, then build the signed release as above. Do not distribute an APK built before the final source changes.
 4. Verify package identity, version and signing certificate. Compare bundled APK assets with the final web build when releasing UI changes.
@@ -281,9 +299,9 @@ $env:JAVA_HOME = $jdkDir.FullName
 Get-FileHash -LiteralPath releases/Pocket-Ledger-release.apk -Algorithm SHA256
 ```
 
-Stop if signature verification fails or the fingerprint/application ID differs. The verified local 1.1.1 APK SHA-256 is `11ee80e840eb9d6e2c8474bc6b131dc3564ad0a93046db663c4f02f61b43ef14`. A later build can have a different file hash; identity, signature, contents and version must still be checked.
+Stop if signature verification fails or the fingerprint/application ID differs. The verified local **1.2.0** APK is **3,049,823 bytes**, with SHA-256 `c969c5d10bd02031114ccda2aca58c095c9304ffd5d5ead32a51056ba0c193ee`. The historical 1.1.1 APK SHA-256 was `11ee80e840eb9d6e2c8474bc6b131dc3564ad0a93046db663c4f02f61b43ef14`. A later build can have a different file hash; identity, signature, contents and version must still be checked.
 
-The APK is a ZIP. Its `assets/www/app.js`, `assets/www/styles.css` and `assets/www/index.html` should match the corresponding final `dist/` files byte-for-byte. Native build/lint reports live under `android/app/build/outputs/` and `android/app/build/reports/`. The last local release evidence is `releases/verification-1.1.1.json`; it is ignored, so a fresh clone must repeat verification rather than assume that file is present.
+The APK is a ZIP. Its `assets/www/app.js`, `assets/www/styles.css` and `assets/www/index.html` should match the corresponding final `dist/` files byte-for-byte. Native build/lint reports live under `android/app/build/outputs/` and `android/app/build/reports/`. The last local release evidence is `releases/verification-1.2.0.json`; it is ignored, so a fresh clone must repeat verification rather than assume that file is present.
 
 Copy the release APK to the tablet and open it in Files, permitting installation from that source when Android asks. With an authorized USB-debugging test device, an alternative is:
 

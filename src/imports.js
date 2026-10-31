@@ -1,5 +1,7 @@
 import {unzipSync,strFromU8} from 'fflate';
-import {parseCSV,normalizeDate,moneyInput,uid,matchSubcategory,resolveClassification} from './core.js';
+import {parseCSV,normalizeDate,moneyInput,uid,resolveClassification} from './core.js';
+export const MAX_STATEMENT_ROWS=500000;
+export const CSV_FILE_LIMIT=128*1024*1024;
 const xml=text=>{const doc=new DOMParser().parseFromString(text,'application/xml');if(doc.querySelector('parsererror'))throw new Error('The spreadsheet contains invalid XML.');return doc;};
 const elements=(node,name)=>node ? [...node.getElementsByTagNameNS('*',name)] : [];
 const first=(node,name)=>elements(node,name)[0];
@@ -86,8 +88,9 @@ export async function readPDF(bytes,password='') {
   } finally {doc?.destroy();await engine.destroy();}
 }
 export async function readFile(file,password='') {
-  if(file.size>20*1024*1024)throw new Error('Please choose a statement smaller than 20 MB.');
   const ext=file.name.split('.').pop().toLowerCase();
+  const largeText=['csv','tsv','txt'].includes(ext),limit=largeText?CSV_FILE_LIMIT:20*1024*1024;
+  if(file.size>limit)throw new Error(`Please choose a ${largeText?'CSV/TSV smaller than 128':'workbook or PDF smaller than 20'} MB.`);
   if(ext==='xlsx')return {sheets:readXLSX(new Uint8Array(await file.arrayBuffer())),kind:'xlsx'};
   if(ext==='pdf'){const raw=await readPDF(new Uint8Array(await file.arrayBuffer()),password);return {sheets:[{name:'PDF text',rows:parseCSV(raw,'\t')}],kind:'pdf',raw};}
   if(['csv','tsv','txt'].includes(ext))return {sheets:[{name:'Statement',rows:parseCSV(await file.text(),ext==='tsv'?'\t':undefined)}],kind:'csv'};
@@ -97,6 +100,11 @@ const aliases={date:['date','transaction date','txn date','value date','posting 
 export function autoMap(header) {const map={};for(const [key,names]of Object.entries(aliases))map[key]=header.findIndex(h=>names.includes(String(h).trim().toLowerCase()));return map;}
 export function mapTransactions(rows,mapping,{dateFormat='DMY',account='',defaultSubcategory='',categories=[],signedMode='negative-debit',date1904=false}={}) {
   const get=(r,key)=>mapping[key]>=0?r[mapping[key]]??'':'';
+  // Unmapped aliases have no input value to preserve. Keeping only mapped
+  // fields saves dozens of megabytes in a large encrypted JSON payload; the
+  // complete original row is retained separately in sourceRow.
+  const normalize=value=>String(value??'').trim().toLowerCase(),parents=new Map(),children=new Map(),defaultClassification=resolveClassification(categories,defaultSubcategory),rawKeys=Object.keys(aliases).filter(key=>mapping[key]>=0),dates=new Map();
+  for(const c of categories){const name=normalize(c.name);if(!parents.has(name))parents.set(name,c);for(const subcategory of c.subs){const key=normalize(subcategory),matches=children.get(key)||[];matches.push({categoryId:c.id,subcategory});children.set(key,matches);}}
   return rows.map(row=>{
     let debit=moneyInput(get(row,'debit')),credit=moneyInput(get(row,'credit'));
     if(mapping.amount>=0 && mapping.debit<0 && mapping.credit<0) {
@@ -106,12 +114,14 @@ export function mapTransactions(rows,mapping,{dateFormat='DMY',account='',defaul
       if(!Number.isFinite(amount))debit=NaN;
     }
     const subcategory=String(get(row,'subcategory')).trim();
-    const parent=categories.find(c=>c.name.trim().toLowerCase()===String(get(row,'category')).trim().toLowerCase());
-    const classification=subcategory ? matchSubcategory(categories,subcategory,get(row,'category')) : resolveClassification(categories,defaultSubcategory)|| (parent?{categoryId:parent.id,subcategory:''}:null);
+    const parent=parents.get(normalize(get(row,'category'))),matches=children.get(normalize(subcategory))||[];
+    const qualified=matches.length===1?matches:matches.filter(m=>m.categoryId===parent?.id);
+    const classification=subcategory ? qualified.length===1?qualified[0]:null : defaultClassification|| (parent?{categoryId:parent.id,subcategory:''}:null);
     const adjustment=mapping.final>=0 && String(get(row,'final')).trim()!=='' ? moneyInput(get(row,'final'))-debit+credit : 0;
     let dateValue=get(row,'date');if(date1904 && typeof dateValue==='number')dateValue+=1462;
-    const rawValues=Object.fromEntries(Object.keys(aliases).map(k=>[k,get(row,k)]));
+    const rawValues={};for(const key of rawKeys)rawValues[key]=get(row,key);
+    if(!dates.has(dateValue)){if(dates.size>=4096)dates.clear();dates.set(dateValue,normalizeDate(dateValue,dateFormat));}
     const safe=n=>Number.isSafeInteger(n)&&Math.abs(n)<1e14?n:null;
-    return {id:uid(),date:normalizeDate(dateValue,dateFormat),description:String(get(row,'description')),debit:safe(debit),credit:safe(credit),adjustment:safe(adjustment),categoryId:classification?.categoryId||'',subcategory:classification?.subcategory||subcategory,account:String(get(row,'account')||account),rawValues,sourceRow:row,include:true};
+    return {id:uid(),date:dates.get(dateValue),description:String(get(row,'description')),debit:safe(debit),credit:safe(credit),adjustment:safe(adjustment),categoryId:classification?.categoryId||'',subcategory:classification?.subcategory||subcategory,account:String(get(row,'account')||account),rawValues,sourceRow:row,include:true};
   });
 }

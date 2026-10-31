@@ -56,7 +56,7 @@ try {
   assert.ok((await page.locator('tbody').textContent()).includes('2,400.00'));check('CSV mapping, editable review, finalized adjustment');
 
   await nav('imports');await page.locator('#statement-file').setInputFiles('samples/statement.csv');await page.locator('#map-form [type=submit]').click();await page.locator('.review').waitFor();
-  assert.equal(await page.locator('.review input[type=checkbox]:checked').count(),0);check('duplicate rows excluded on repeat import');await action('reset-import');
+  assert.equal(await page.locator('.review input[type=checkbox]:checked').count(),await page.locator('.review input[type=checkbox]').count());check('repeat imports retain every selected row');await action('reset-import');
 
   await page.locator('#statement-file').setInputFiles('test-results/fixtures/statement.xlsx');await page.locator('#map-form').waitFor();await page.locator('#map-form [type=submit]').click();
   await page.locator('.review').waitFor();assert.equal(await page.locator('.review').count(),1);
